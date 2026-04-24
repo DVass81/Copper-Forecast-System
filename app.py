@@ -17,6 +17,8 @@ SETTINGS_PATH = DATA_DIR / "copper_forecast_settings.json"
 FORECASTS_PATH = DATA_DIR / "copper_future_demand.json"
 IMPORT_HISTORY_PATH = DATA_DIR / "copper_import_history.json"
 ACTIONS_PATH = DATA_DIR / "copper_item_actions.json"
+LARGE_JOBS_PATH = DATA_DIR / "copper_large_jobs.json"
+REVIEW_HISTORY_PATH = DATA_DIR / "copper_review_history.json"
 LOCAL_WORKBOOK_PATH = APP_DIR / "March Copper Review Final.xlsx"
 ONEDRIVE_WORKBOOK_PATH = (
     Path.home()
@@ -45,6 +47,11 @@ WEEKLY_PROFILES = {
     "Even": [0.25, 0.25, 0.25, 0.25],
     "Mid-month spike": [0.20, 0.35, 0.30, 0.15],
     "Back-loaded": [0.20, 0.20, 0.25, 0.35],
+}
+CONFIDENCE_WEIGHTS = {
+    "High": 1.0,
+    "Medium": 0.6,
+    "Low": 0.3,
 }
 
 
@@ -323,6 +330,11 @@ def build_default_settings() -> dict:
         "active_scenario": "Base",
         "planning_horizon_weeks": 26,
         "weekly_demand_profile": "Front-loaded",
+        "source_moq_lbs": {
+            "direct_mill": 40000.0,
+            "distribution": 10000.0,
+        },
+        "confidence_weights": dict(CONFIDENCE_WEIGHTS),
     }
 
 
@@ -336,6 +348,8 @@ def load_settings() -> dict:
     defaults["active_scenario"] = saved.get("active_scenario", "Base") or "Base"
     defaults["planning_horizon_weeks"] = int(saved.get("planning_horizon_weeks", 26) or 26)
     defaults["weekly_demand_profile"] = saved.get("weekly_demand_profile", "Front-loaded") or "Front-loaded"
+    defaults["source_moq_lbs"].update(saved.get("source_moq_lbs", {}))
+    defaults["confidence_weights"].update(saved.get("confidence_weights", {}))
     return defaults
 
 
@@ -518,6 +532,25 @@ def choose_source(source_override: str, recommendation_qty: float, preferred_mil
     return preferred_mill
 
 
+def apply_moq_to_recommendation(
+    recommendation_qty: float,
+    recommended_source: str,
+    settings: dict,
+) -> tuple[float, str]:
+    if recommendation_qty <= 0 or recommended_source == "None":
+        return 0.0, ""
+    moq_settings = settings.get("source_moq_lbs", {})
+    if recommended_source in DIST_SOURCES:
+        moq = number(moq_settings.get("distribution", moq_settings.get("distribution_lbs", 10000.0)))
+        if 0 < recommendation_qty < moq:
+            return moq, f"Raised to distribution MOQ of {moq:,.0f} lbs."
+        return recommendation_qty, ""
+    moq = number(moq_settings.get("direct_mill", moq_settings.get("direct_mill_lbs", 40000.0)))
+    if 0 < recommendation_qty < moq:
+        return moq, f"Raised to direct mill MOQ of {moq:,.0f} lbs."
+    return recommendation_qty, ""
+
+
 def normalize_forecast_entries(raw_payload: dict | list) -> list[dict]:
     if isinstance(raw_payload, dict):
         entries = raw_payload.get("entries", [])
@@ -533,6 +566,7 @@ def normalize_forecast_entries(raw_payload: dict | list) -> list[dict]:
         month = clean_size(entry.get("month"))
         scenario = clean_size(entry.get("scenario")) or "Base"
         lbs = number(entry.get("monthly_lbs"))
+        confidence = clean_size(entry.get("confidence")) or "High"
         if size and month:
             cleaned.append(
                 {
@@ -541,12 +575,41 @@ def normalize_forecast_entries(raw_payload: dict | list) -> list[dict]:
                     "scenario": scenario,
                     "monthly_lbs": lbs,
                     "note": clean_size(entry.get("note")),
+                    "confidence": confidence,
+                    "customer": clean_size(entry.get("customer")),
                 }
             )
     return cleaned
 
 
-def build_future_demand_map(forecast_entries: list[dict], active_scenario: str) -> dict[str, dict]:
+def normalize_large_job_entries(raw_payload: dict | list) -> list[dict]:
+    if isinstance(raw_payload, dict):
+        entries = raw_payload.get("entries", [])
+    elif isinstance(raw_payload, list):
+        entries = raw_payload
+    else:
+        entries = []
+    cleaned = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        size = clean_size(entry.get("size"))
+        month = clean_size(entry.get("month"))
+        lbs = number(entry.get("lbs"))
+        if size and month and lbs:
+            cleaned.append(
+                {
+                    "size": size,
+                    "month": month,
+                    "lbs": lbs,
+                    "job_name": clean_size(entry.get("job_name")),
+                    "note": clean_size(entry.get("note")),
+                }
+            )
+    return cleaned
+
+
+def build_future_demand_map(forecast_entries: list[dict], active_scenario: str, settings: dict) -> dict[str, dict]:
     selected = [entry for entry in forecast_entries if entry.get("scenario") == active_scenario]
     grouped: dict[str, list[dict]] = {}
     for entry in selected:
@@ -554,24 +617,48 @@ def build_future_demand_map(forecast_entries: list[dict], active_scenario: str) 
     result: dict[str, dict] = {}
     for size, entries in grouped.items():
         sorted_entries = sorted(entries, key=lambda item: item["month"])
-        monthly_values = [number(item.get("monthly_lbs")) for item in sorted_entries]
+        monthly_values = [
+            number(item.get("monthly_lbs")) * number(settings.get("confidence_weights", {}).get(item.get("confidence", "High"), 1.0))
+            for item in sorted_entries
+        ]
         result[size] = {
             "future_monthly_lbs": sum(monthly_values) / len(monthly_values) if monthly_values else 0.0,
             "future_total_lbs": sum(monthly_values),
             "future_month_count": len(monthly_values),
             "future_months": ", ".join(item["month"] for item in sorted_entries[:6]),
+            "future_confidence_mix": ", ".join(sorted({item.get("confidence", "High") for item in sorted_entries})),
         }
     return result
 
 
-def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries: list[dict]) -> list[dict]:
+def format_date_from_weeks(weeks_from_now: float) -> str:
+    target = datetime.today() + timedelta(weeks=max(0.0, weeks_from_now))
+    return target.strftime("%Y-%m-%d")
+
+
+def recommendation_timing(row: dict, settings: dict) -> tuple[str, str]:
+    source_name = row.get("recommended_source", settings.get("preferred_mill", ACTIVE_MILL))
+    if source_name in DIST_SOURCES:
+        lead_weeks = number(settings.get("source_lead_weeks", {}).get(source_name, 13.0))
+    elif source_name == "None":
+        lead_weeks = 0.0
+    else:
+        lead_weeks = number(settings.get("source_lead_weeks", {}).get(settings.get("preferred_mill", ACTIVE_MILL), 11.0))
+    weeks_to_stockout = number(row.get("net_coverage_weeks", 0.0))
+    order_by_weeks = max(0.0, weeks_to_stockout - lead_weeks)
+    order_by = "Now" if row.get("action_bucket") in {"Order Now", "Pull From DC"} or order_by_weeks <= 0 else format_date_from_weeks(order_by_weeks)
+    receipt_date = format_date_from_weeks(lead_weeks) if lead_weeks > 0 else "N/A"
+    return order_by, receipt_date
+
+
+def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries: list[dict], large_job_entries: list[dict]) -> list[dict]:
     items = snapshot.get("items", [])
     lead_weeks = settings.get("source_lead_weeks", {})
     safety_by_mover = settings.get("safety_weeks_by_mover", {})
     preferred_mill = settings.get("preferred_mill", ACTIVE_MILL)
     future_mill = settings.get("future_mill", FUTURE_MILL)
     active_scenario = settings.get("active_scenario", "Base")
-    future_demand_map = build_future_demand_map(forecast_entries, active_scenario)
+    future_demand_map = build_future_demand_map(forecast_entries, active_scenario, settings)
     mover_map = classify_movers(items)
     planning_rows = []
     for item in items:
@@ -579,7 +666,11 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
         base_monthly_lbs = item.get("avg_monthly_lbs") or round(item.get("adjusted_usage_7mo_lbs", 0.0) / 7.0, 2)
         manual_adjustment_lbs = float(override.get("manual_adjustment_lbs", 0.0) or 0.0)
         future_sales_lbs = future_demand_map.get(item["size"], {}).get("future_monthly_lbs", 0.0)
-        forecast_monthly_lbs = max(0.0, base_monthly_lbs + manual_adjustment_lbs + future_sales_lbs)
+        large_job_monthly_lbs = (
+            sum(number(entry.get("lbs", 0.0)) for entry in large_job_entries if entry.get("size") == item["size"])
+            / max(1, round(number(settings.get("planning_horizon_weeks", 26)) / 4))
+        )
+        forecast_monthly_lbs = max(0.0, base_monthly_lbs + manual_adjustment_lbs + future_sales_lbs + large_job_monthly_lbs)
         weekly_usage = forecast_monthly_lbs / 4.345 if forecast_monthly_lbs else 0.0
         mover_class = mover_map.get(item["size"], "Slow")
         safety_weeks = float(safety_by_mover.get(mover_class, DEFAULT_SAFETY_WEEKS_BY_MOVER[mover_class]))
@@ -609,13 +700,17 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
         )
         source_override = override.get("source_override", "Auto")
         recommended_source = choose_source(source_override, recommendation_qty, preferred_mill)
+        moq_note = ""
         if action_bucket == "Pull From DC":
             recommendation_qty = min(dc_on_hand_lbs, max(0.0, (weekly_usage * 6.0) - plant_available_lbs))
             recommended_source = source_override if source_override not in {"", "Auto"} else largest_dc_source(item)
+            recommendation_qty, moq_note = apply_moq_to_recommendation(recommendation_qty, recommended_source, settings)
         elif action_bucket in {"Healthy", "Monitor", "Excess Risk"}:
             recommendation_qty = 0.0 if action_bucket != "Monitor" else recommendation_qty
             if action_bucket == "Excess Risk":
                 recommended_source = "None"
+        else:
+            recommendation_qty, moq_note = apply_moq_to_recommendation(recommendation_qty, recommended_source, settings)
 
         planning_rows.append(
             {
@@ -624,6 +719,7 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
                 "base_monthly_lbs": base_monthly_lbs,
                 "manual_adjustment_lbs": manual_adjustment_lbs,
                 "future_sales_monthly_lbs": future_sales_lbs,
+                "large_job_monthly_lbs": large_job_monthly_lbs,
                 "forecast_monthly_lbs": forecast_monthly_lbs,
                 "plant_available_lbs": plant_available_lbs,
                 "dc_on_hand_lbs": dc_on_hand_lbs,
@@ -639,19 +735,23 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
                 "recommended_order_lbs": recommendation_qty,
                 "recommended_source": recommended_source,
                 "action_bucket": action_bucket,
-                "recommendation_reason": recommendation_reason,
+                "recommendation_reason": (recommendation_reason + (" " + moq_note if moq_note else "")).strip(),
                 "jobs_pending_lbs": item.get("jobs_pending_lbs", 0.0),
                 "override_note": override.get("note", "").strip(),
                 "preferred_mill": preferred_mill,
                 "future_mill": future_mill,
                 "active_scenario": active_scenario,
                 "future_sales_months": future_demand_map.get(item["size"], {}).get("future_months", ""),
+                "future_confidence_mix": future_demand_map.get(item["size"], {}).get("future_confidence_mix", ""),
+                "moq_note": moq_note,
             }
         )
+    for row in planning_rows:
+        row["order_by_date"], row["expected_receipt_date"] = recommendation_timing(row, settings)
     return sorted(planning_rows, key=planning_sort_key)
 
 
-def get_monthly_demand_map(plan_row: dict, forecast_entries: list[dict], settings: dict) -> dict[str, float]:
+def get_monthly_demand_map(plan_row: dict, forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> dict[str, float]:
     active_scenario = settings.get("active_scenario", "Base")
     base_monthly = number(plan_row.get("base_monthly_lbs", 0.0)) + number(plan_row.get("manual_adjustment_lbs", 0.0))
     month_map: dict[str, float] = {}
@@ -662,7 +762,12 @@ def get_monthly_demand_map(plan_row: dict, forecast_entries: list[dict], setting
     ]
     for entry in matching_entries:
         month_key = entry["month"]
-        month_map[month_key] = base_monthly + number(entry.get("monthly_lbs", 0.0))
+        weight = number(settings.get("confidence_weights", {}).get(entry.get("confidence", "High"), 1.0))
+        month_map[month_key] = base_monthly + number(entry.get("monthly_lbs", 0.0)) * weight
+    for job in large_job_entries:
+        if job.get("size") == plan_row["size"]:
+            month_key = job["month"]
+            month_map[month_key] = month_map.get(month_key, base_monthly) + number(job.get("lbs", 0.0))
     start_month = month_start(datetime.today())
     for offset in range(9):
         month_key = add_months(start_month, offset).strftime("%Y-%m")
@@ -685,10 +790,10 @@ def monthly_profile_for_week_count(week_count: int, settings: dict) -> list[floa
     return [value / total for value in raw]
 
 
-def build_weekly_projection(plan_row: dict, forecast_entries: list[dict], settings: dict) -> list[dict]:
+def build_weekly_projection(plan_row: dict, forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> list[dict]:
     horizon_weeks = int(settings.get("planning_horizon_weeks", 26) or 26)
     today_week = start_of_week(datetime.today())
-    monthly_demand_map = get_monthly_demand_map(plan_row, forecast_entries, settings)
+    monthly_demand_map = get_monthly_demand_map(plan_row, forecast_entries, large_job_entries, settings)
     total_supply = number(plan_row.get("plant_available_lbs", 0.0)) + number(plan_row.get("dc_on_hand_lbs", 0.0))
     inbound_events = {
         int(round(number(settings["source_lead_weeks"].get(settings.get("preferred_mill", ACTIVE_MILL), 11.0)))): number(
@@ -744,10 +849,10 @@ def summarize_projection(weeks: list[dict]) -> dict:
     }
 
 
-def build_exception_rows(plan_rows: list[dict], forecast_entries: list[dict], settings: dict) -> list[dict]:
+def build_exception_rows(plan_rows: list[dict], forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> list[dict]:
     rows = []
     for row in plan_rows:
-        weeks = build_weekly_projection(row, forecast_entries, settings)
+        weeks = build_weekly_projection(row, forecast_entries, large_job_entries, settings)
         projection_summary = summarize_projection(weeks)
         weeks_to_stockout = projection_summary["weeks_to_stockout"]
         horizon_bucket = "No stockout in horizon"
@@ -886,6 +991,13 @@ def render_items(plan_rows: list[dict]) -> None:
     st.write(f"Future sales demand added: {row['future_sales_monthly_lbs']:,.0f} lbs / month")
     if row["future_sales_months"]:
         st.write(f"Sales months in scenario: {row['future_sales_months']}")
+    if row.get("future_confidence_mix"):
+        st.write(f"Sales confidence mix: {row['future_confidence_mix']}")
+    st.write(f"Large-job demand added: {row.get('large_job_monthly_lbs', 0.0):,.0f} lbs / month")
+    if row.get("moq_note"):
+        st.write(f"MOQ rule: {row['moq_note']}")
+    st.write(f"Order by: {row.get('order_by_date', 'Now')}")
+    st.write(f"Expected receipt: {row.get('expected_receipt_date', 'N/A')}")
 
 
 def render_supply_plan(plan_rows: list[dict]) -> None:
@@ -926,6 +1038,8 @@ def render_recommendations(plan_rows: list[dict]) -> None:
             "Reorder Point": round(row["reorder_point_lbs"], 0),
             "Target Stock": round(row["target_stock_lbs"], 0),
             "Scenario": row["active_scenario"],
+            "Order By": row.get("order_by_date", "Now"),
+            "Expected Receipt": row.get("expected_receipt_date", "N/A"),
             "Reason": row["recommendation_reason"],
         }
         for row in plan_rows
@@ -960,6 +1074,8 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
         "\n".join(
             [
                 "forecast_monthly_lbs = base_monthly_lbs + manual_adjustment_lbs + future_sales_monthly_lbs",
+                "future_sales_monthly_lbs uses confidence-weighted sales entries by scenario",
+                "large_job_monthly_lbs adds large-job demand into the planning horizon",
                 "weekly_usage = forecast_monthly_lbs / 4.345",
                 "plant_available_lbs = icc_inventory_current_lbs - jobs_pending_lbs",
                 "dc_on_hand_lbs = williams_on_hand_lbs + maverick_on_hand_lbs",
@@ -995,6 +1111,13 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
         st.write("Safety stock by mover (weeks):")
         for mover_name, weeks in settings.get("safety_weeks_by_mover", {}).items():
             st.write(f"- {mover_name}: {weeks}")
+        moq_settings = settings.get("source_moq_lbs", {})
+        st.write("MOQ rules:")
+        st.write(f"- Direct mill: {number(moq_settings.get('direct_mill', 40000.0)):,.0f} lbs")
+        st.write(f"- Distribution: {number(moq_settings.get('distribution', 10000.0)):,.0f} lbs")
+        st.write("Sales confidence weights:")
+        for confidence, weight in settings.get("confidence_weights", {}).items():
+            st.write(f"- {confidence}: {weight}")
         st.write(f"Future demand entries loaded: {len(forecast_entries)}")
         st.write(f"Items currently in plan: {len(plan_rows)}")
 
@@ -1006,14 +1129,14 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
     st.write("`ERP API automation` is not built yet.")
 
 
-def render_projection_tab(plan_rows: list[dict], forecast_entries: list[dict], settings: dict) -> None:
+def render_projection_tab(plan_rows: list[dict], forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> None:
     st.markdown("#### Weekly Projection")
     if not plan_rows:
         st.info("Load your workbook first to build weekly projections.")
         return
     selected_size = st.selectbox("Projection item", [row["size"] for row in plan_rows], key="projection_size")
     selected_row = next(row for row in plan_rows if row["size"] == selected_size)
-    weeks = build_weekly_projection(selected_row, forecast_entries, settings)
+    weeks = build_weekly_projection(selected_row, forecast_entries, large_job_entries, settings)
     summary = summarize_projection(weeks)
     summary_cols = st.columns(4)
     summary_cols[0].metric("Active scenario", selected_row["active_scenario"])
@@ -1037,12 +1160,12 @@ def render_projection_tab(plan_rows: list[dict], forecast_entries: list[dict], s
     )
 
 
-def render_exceptions_tab(plan_rows: list[dict], forecast_entries: list[dict], settings: dict) -> None:
+def render_exceptions_tab(plan_rows: list[dict], forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> None:
     st.markdown("#### Exception Dashboard")
     if not plan_rows:
         st.info("No exceptions to show until the workbook is loaded.")
         return
-    exception_rows = build_exception_rows(plan_rows, forecast_entries, settings)
+    exception_rows = build_exception_rows(plan_rows, forecast_entries, large_job_entries, settings)
     filter_value = st.selectbox(
         "Exception filter",
         ["All", "Stockout <= 4 weeks", "Stockout <= 8 weeks", "Stockout <= 12 weeks", "No stockout in horizon"],
@@ -1061,6 +1184,45 @@ def render_history_tab() -> None:
         st.info("No import history yet.")
         return
     st.dataframe(list(reversed(entries)), use_container_width=True, hide_index=True)
+
+
+def render_snapshot_compare_tab(snapshot: dict) -> None:
+    st.markdown("#### Snapshot Comparison")
+    history_payload = load_json(IMPORT_HISTORY_PATH)
+    entries = history_payload.get("entries", []) if isinstance(history_payload, dict) else []
+    if len(entries) < 2:
+        st.info("Import at least two snapshots to compare changes.")
+        return
+    latest = entries[-1]
+    previous = entries[-2]
+    compare_rows = [
+        {
+            "Metric": "Item count",
+            "Previous": previous.get("item_count", 0),
+            "Latest": latest.get("item_count", 0),
+            "Delta": latest.get("item_count", 0) - previous.get("item_count", 0),
+        },
+        {
+            "Metric": "Current inventory lbs",
+            "Previous": previous.get("current_inventory_lbs", 0),
+            "Latest": latest.get("current_inventory_lbs", 0),
+            "Delta": latest.get("current_inventory_lbs", 0) - previous.get("current_inventory_lbs", 0),
+        },
+        {
+            "Metric": "Plant available lbs",
+            "Previous": previous.get("plant_available_lbs", 0),
+            "Latest": latest.get("plant_available_lbs", 0),
+            "Delta": latest.get("plant_available_lbs", 0) - previous.get("plant_available_lbs", 0),
+        },
+        {
+            "Metric": "Mill on order lbs",
+            "Previous": previous.get("mill_on_order_lbs", 0),
+            "Latest": latest.get("mill_on_order_lbs", 0),
+            "Delta": latest.get("mill_on_order_lbs", 0) - previous.get("mill_on_order_lbs", 0),
+        },
+    ]
+    st.write(f"Comparing `{previous.get('imported_at', '')}` to `{latest.get('imported_at', '')}`")
+    st.dataframe(compare_rows, use_container_width=True, hide_index=True)
 
 
 def render_actions_tab(plan_rows: list[dict]) -> None:
@@ -1089,6 +1251,18 @@ def render_actions_tab(plan_rows: list[dict]) -> None:
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         save_json(ACTIONS_PATH, actions)
+        review_payload = load_json(REVIEW_HISTORY_PATH)
+        review_entries = review_payload.get("entries", []) if isinstance(review_payload, dict) else []
+        review_entries.append(
+            {
+                "size": selected_size,
+                "owner": owner.strip(),
+                "status": status,
+                "note": note.strip(),
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
+        )
+        save_json(REVIEW_HISTORY_PATH, {"entries": review_entries[-200:]})
         st.success(f"Saved action details for {selected_size}.")
         st.rerun()
     if actions:
@@ -1106,6 +1280,16 @@ def render_actions_tab(plan_rows: list[dict]) -> None:
             use_container_width=True,
             hide_index=True,
         )
+
+
+def render_review_history_tab() -> None:
+    st.markdown("#### Review History")
+    review_payload = load_json(REVIEW_HISTORY_PATH)
+    entries = review_payload.get("entries", []) if isinstance(review_payload, dict) else []
+    if not entries:
+        st.info("No review history yet.")
+        return
+    st.dataframe(list(reversed(entries)), use_container_width=True, hide_index=True)
 
 
 def render_overrides(plan_rows: list[dict], overrides: dict) -> None:
@@ -1187,6 +1371,43 @@ def render_settings(settings: dict) -> None:
             index=list(WEEKLY_PROFILES).index(settings.get("weekly_demand_profile", "Front-loaded")),
             help="Use this to shape how monthly demand is distributed within each month.",
         )
+        st.markdown("#### MOQ Rules (lbs)")
+        moq_col1, moq_col2 = st.columns(2)
+        direct_mill_moq = moq_col1.number_input(
+            "Direct mill MOQ",
+            min_value=0.0,
+            value=float(settings.get("source_moq_lbs", {}).get("direct_mill", 40000.0)),
+            step=1000.0,
+        )
+        distribution_moq = moq_col2.number_input(
+            "Distribution MOQ",
+            min_value=0.0,
+            value=float(settings.get("source_moq_lbs", {}).get("distribution", 10000.0)),
+            step=1000.0,
+        )
+        st.markdown("#### Sales Confidence Weights")
+        conf_col1, conf_col2, conf_col3 = st.columns(3)
+        high_weight = conf_col1.number_input(
+            "High confidence",
+            min_value=0.0,
+            max_value=1.5,
+            value=float(settings.get("confidence_weights", {}).get("High", 1.0)),
+            step=0.1,
+        )
+        medium_weight = conf_col2.number_input(
+            "Medium confidence",
+            min_value=0.0,
+            max_value=1.5,
+            value=float(settings.get("confidence_weights", {}).get("Medium", 0.6)),
+            step=0.1,
+        )
+        low_weight = conf_col3.number_input(
+            "Low confidence",
+            min_value=0.0,
+            max_value=1.5,
+            value=float(settings.get("confidence_weights", {}).get("Low", 0.3)),
+            step=0.1,
+        )
         st.markdown("#### Lead Times (weeks)")
         lead_col1, lead_col2, lead_col3, lead_col4 = st.columns(4)
         tecnofil_weeks = lead_col1.number_input(
@@ -1236,6 +1457,15 @@ def render_settings(settings: dict) -> None:
                 "active_scenario": active_scenario,
                 "planning_horizon_weeks": int(planning_horizon_weeks),
                 "weekly_demand_profile": weekly_demand_profile,
+                "source_moq_lbs": {
+                    "direct_mill": direct_mill_moq,
+                    "distribution": distribution_moq,
+                },
+                "confidence_weights": {
+                    "High": high_weight,
+                    "Medium": medium_weight,
+                    "Low": low_weight,
+                },
                 "source_lead_weeks": {
                     "Tecnofil": tecnofil_weeks,
                     "Coppr Rod": coppr_rod_weeks,
@@ -1300,11 +1530,13 @@ def render_future_demand(plan_rows: list[dict], forecast_entries: list[dict]) ->
 
     size_options = [row["size"] for row in plan_rows]
     with st.form("future_demand_form"):
-        entry_cols = st.columns(4)
+        entry_cols = st.columns(5)
         selected_size = entry_cols[0].selectbox("Copper size", size_options)
         scenario = entry_cols[1].selectbox("Scenario", ["Base", "Upside", "Downside"])
         month_date = entry_cols[2].date_input("Month", value=datetime.today().date().replace(day=1))
         monthly_lbs = entry_cols[3].number_input("Monthly lbs", min_value=0.0, step=100.0)
+        confidence = entry_cols[4].selectbox("Confidence", ["High", "Medium", "Low"])
+        customer = st.text_input("Customer / Program")
         note = st.text_area("Sales note", height=90)
         submitted = st.form_submit_button("Add demand entry")
 
@@ -1316,6 +1548,8 @@ def render_future_demand(plan_rows: list[dict], forecast_entries: list[dict]) ->
             if entry["size"] == selected_size and entry["scenario"] == scenario and entry["month"] == month_value:
                 entry["monthly_lbs"] = monthly_lbs
                 entry["note"] = note.strip()
+                entry["confidence"] = confidence
+                entry["customer"] = customer.strip()
                 replaced = True
                 break
         if not replaced:
@@ -1326,6 +1560,8 @@ def render_future_demand(plan_rows: list[dict], forecast_entries: list[dict]) ->
                     "month": month_value,
                     "monthly_lbs": monthly_lbs,
                     "note": note.strip(),
+                    "confidence": confidence,
+                    "customer": customer.strip(),
                 }
             )
         save_json(FORECASTS_PATH, entries_payload)
@@ -1340,6 +1576,8 @@ def render_future_demand(plan_rows: list[dict], forecast_entries: list[dict]) ->
                 "Scenario": entry["scenario"],
                 "Month": entry["month"],
                 "Monthly lbs": entry["monthly_lbs"],
+                "Confidence": entry.get("confidence", "High"),
+                "Customer / Program": entry.get("customer", ""),
                 "Note": entry.get("note", ""),
             }
             for entry in sorted(forecast_entries, key=lambda item: (item["scenario"], item["month"], item["size"]))
@@ -1349,10 +1587,58 @@ def render_future_demand(plan_rows: list[dict], forecast_entries: list[dict]) ->
         st.info("No future sales demand entries have been added yet.")
 
 
-def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecast_entries: list[dict]) -> None:
+def render_large_jobs_tab(plan_rows: list[dict], large_job_entries: list[dict]) -> None:
+    st.markdown("#### Large Job Plan")
+    if not plan_rows:
+        st.info("Load your workbook first so active copper sizes are available.")
+        return
+    size_options = [row["size"] for row in plan_rows]
+    with st.form("large_job_form"):
+        cols = st.columns(4)
+        selected_size = cols[0].selectbox("Copper size", size_options, key="large_job_size")
+        month_date = cols[1].date_input("Due month", value=datetime.today().date().replace(day=1), key="large_job_month")
+        lbs = cols[2].number_input("Job lbs", min_value=0.0, step=100.0, key="large_job_lbs")
+        job_name = cols[3].text_input("Job / Program", key="large_job_name")
+        note = st.text_area("Large job note", height=90, key="large_job_note")
+        submitted = st.form_submit_button("Add large job")
+    payload = {"entries": list(large_job_entries)}
+    if submitted:
+        payload["entries"].append(
+            {
+                "size": selected_size,
+                "month": month_date.strftime("%Y-%m"),
+                "lbs": lbs,
+                "job_name": job_name.strip(),
+                "note": note.strip(),
+            }
+        )
+        save_json(LARGE_JOBS_PATH, payload)
+        st.success(f"Saved large job for {selected_size}.")
+        st.rerun()
+    if large_job_entries:
+        st.dataframe(
+            [
+                {
+                    "Copper Size": entry["size"],
+                    "Due Month": entry["month"],
+                    "Job lbs": entry["lbs"],
+                    "Job / Program": entry.get("job_name", ""),
+                    "Note": entry.get("note", ""),
+                }
+                for entry in large_job_entries
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No large jobs entered yet.")
+
+
+def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecast_entries: list[dict], large_job_entries: list[dict]) -> None:
     config = get_supabase_config()
     import_history = load_json(IMPORT_HISTORY_PATH)
     item_actions = load_json(ACTIONS_PATH)
+    review_history = load_json(REVIEW_HISTORY_PATH)
     st.markdown("#### Supabase Connection")
     if config["enabled"]:
         st.success("Supabase configuration detected.")
@@ -1386,7 +1672,9 @@ def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecas
             upsert_supabase_state(config, "future_demand", {"entries": forecast_entries})
             upsert_supabase_state(config, "import_history", import_history)
             upsert_supabase_state(config, "item_actions", item_actions)
-            st.success("Synced snapshot, overrides, settings, future demand, import history, and item actions to Supabase.")
+            upsert_supabase_state(config, "large_jobs", {"entries": large_job_entries})
+            upsert_supabase_state(config, "review_history", review_history)
+            st.success("Synced snapshot, overrides, settings, future demand, large jobs, import history, item actions, and review history to Supabase.")
         except requests.RequestException as exc:
             st.error(f"Supabase sync failed: {exc}")
 
@@ -1398,6 +1686,8 @@ def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecas
             remote_future_demand = fetch_supabase_state(config, "future_demand")
             remote_import_history = fetch_supabase_state(config, "import_history")
             remote_item_actions = fetch_supabase_state(config, "item_actions")
+            remote_large_jobs = fetch_supabase_state(config, "large_jobs")
+            remote_review_history = fetch_supabase_state(config, "review_history")
             if remote_snapshot:
                 save_json(STATE_PATH, remote_snapshot)
             if remote_overrides:
@@ -1410,6 +1700,10 @@ def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecas
                 save_json(IMPORT_HISTORY_PATH, remote_import_history)
             if remote_item_actions:
                 save_json(ACTIONS_PATH, remote_item_actions)
+            if remote_large_jobs:
+                save_json(LARGE_JOBS_PATH, remote_large_jobs)
+            if remote_review_history:
+                save_json(REVIEW_HISTORY_PATH, remote_review_history)
             st.success("Loaded available state from Supabase.")
             st.rerun()
         except requests.RequestException as exc:
@@ -1422,19 +1716,23 @@ def main() -> None:
     overrides = load_json(OVERRIDES_PATH)
     settings = load_settings()
     forecast_entries = normalize_forecast_entries(load_json(FORECASTS_PATH))
-    plan_rows = build_plan(snapshot, overrides, settings, forecast_entries)
+    large_job_entries = normalize_large_job_entries(load_json(LARGE_JOBS_PATH))
+    plan_rows = build_plan(snapshot, overrides, settings, forecast_entries, large_job_entries)
     render_hero(snapshot, plan_rows)
-    dashboard_tab, items_tab, projection_tab, exceptions_tab, supply_tab, reorder_tab, logic_tab, future_tab, actions_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
+    dashboard_tab, items_tab, projection_tab, exceptions_tab, compare_tab, supply_tab, reorder_tab, logic_tab, future_tab, large_jobs_tab, actions_tab, review_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
         [
             "Dashboard",
             "Copper Items",
             "Weekly Projection",
             "Exceptions",
+            "Snapshot Compare",
             "Supply Plan",
             "Reorder Recommendations",
             "Logic",
             "Future Demand Plan",
+            "Large Jobs",
             "Item Actions",
+            "Review History",
             "Manual Forecast Overrides",
             "Planning Settings",
             "Import History",
@@ -1447,9 +1745,11 @@ def main() -> None:
     with items_tab:
         render_items(plan_rows)
     with projection_tab:
-        render_projection_tab(plan_rows, forecast_entries, settings)
+        render_projection_tab(plan_rows, forecast_entries, large_job_entries, settings)
     with exceptions_tab:
-        render_exceptions_tab(plan_rows, forecast_entries, settings)
+        render_exceptions_tab(plan_rows, forecast_entries, large_job_entries, settings)
+    with compare_tab:
+        render_snapshot_compare_tab(snapshot)
     with supply_tab:
         render_supply_plan(plan_rows)
     with reorder_tab:
@@ -1458,8 +1758,12 @@ def main() -> None:
         render_logic_tab(settings, plan_rows, forecast_entries)
     with future_tab:
         render_future_demand(plan_rows, forecast_entries)
+    with large_jobs_tab:
+        render_large_jobs_tab(plan_rows, large_job_entries)
     with actions_tab:
         render_actions_tab(plan_rows)
+    with review_tab:
+        render_review_history_tab()
     with overrides_tab:
         render_overrides(plan_rows, overrides)
     with settings_tab:
@@ -1469,7 +1773,7 @@ def main() -> None:
     with import_tab:
         render_import(snapshot)
     with supabase_tab:
-        render_supabase_tab(snapshot, overrides, settings, forecast_entries)
+        render_supabase_tab(snapshot, overrides, settings, forecast_entries, large_job_entries)
 
 
 if __name__ == "__main__":
