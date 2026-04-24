@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+data/
+.streamlit/
+March Copper Review Final.xlsx
