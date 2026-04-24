@@ -1,8 +1,10 @@
 import json
+import os
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
+import requests
 import streamlit as st
 from openpyxl import load_workbook
 
@@ -12,6 +14,7 @@ DATA_DIR = APP_DIR / "data"
 STATE_PATH = DATA_DIR / "copper_forecast_state.json"
 OVERRIDES_PATH = DATA_DIR / "copper_forecast_overrides.json"
 SETTINGS_PATH = DATA_DIR / "copper_forecast_settings.json"
+FORECASTS_PATH = DATA_DIR / "copper_future_demand.json"
 LOCAL_WORKBOOK_PATH = APP_DIR / "March Copper Review Final.xlsx"
 ONEDRIVE_WORKBOOK_PATH = (
     Path.home()
@@ -34,6 +37,7 @@ DEFAULT_SAFETY_WEEKS_BY_MOVER = {
     "Medium": 10.0,
     "Slow": 6.0,
 }
+SUPABASE_STATE_TABLE = "app_state"
 
 
 st.set_page_config(
@@ -162,12 +166,114 @@ def save_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def get_secret_value(*names: str) -> str:
+    for name in names:
+        env_value = os.environ.get(name)
+        if env_value:
+            return env_value.strip()
+        try:
+            secret_value = st.secrets[name]
+        except Exception:  # noqa: BLE001
+            continue
+        if secret_value:
+            return str(secret_value).strip()
+    return ""
+
+
+def get_supabase_config() -> dict:
+    url = get_secret_value("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL").rstrip("/")
+    publishable_key = get_secret_value("SUPABASE_PUBLISHABLE_KEY", "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")
+    return {
+        "url": url,
+        "publishable_key": publishable_key,
+        "enabled": bool(url and publishable_key),
+    }
+
+
+def supabase_headers(config: dict, prefer_resolution: bool = False) -> dict:
+    headers = {
+        "apikey": config["publishable_key"],
+        "Authorization": f"Bearer {config['publishable_key']}",
+        "Content-Type": "application/json",
+    }
+    if prefer_resolution:
+        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    return headers
+
+
+def fetch_supabase_state(config: dict, state_key: str) -> dict:
+    response = requests.get(
+        f"{config['url']}/rest/v1/{SUPABASE_STATE_TABLE}",
+        headers=supabase_headers(config),
+        params={"select": "payload", "state_key": f"eq.{state_key}", "limit": "1"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return {}
+    return rows[0].get("payload", {}) or {}
+
+
+def upsert_supabase_state(config: dict, state_key: str, payload: dict) -> None:
+    response = requests.post(
+        f"{config['url']}/rest/v1/{SUPABASE_STATE_TABLE}",
+        headers=supabase_headers(config, prefer_resolution=True),
+        params={"on_conflict": "state_key"},
+        data=json.dumps(
+            [
+                {
+                    "state_key": state_key,
+                    "payload": payload,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            ]
+        ),
+        timeout=20,
+    )
+    response.raise_for_status()
+
+
+def get_supabase_sql_setup() -> str:
+    return """create table if not exists public.app_state (
+  state_key text primary key,
+  payload jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.app_state enable row level security;
+
+drop policy if exists "Allow anon read app_state" on public.app_state;
+create policy "Allow anon read app_state"
+on public.app_state
+for select
+to anon
+using (true);
+
+drop policy if exists "Allow anon write app_state" on public.app_state;
+create policy "Allow anon write app_state"
+on public.app_state
+for insert
+to anon
+with check (true);
+
+drop policy if exists "Allow anon update app_state" on public.app_state;
+create policy "Allow anon update app_state"
+on public.app_state
+for update
+to anon
+using (true)
+with check (true);
+"""
+
+
 def build_default_settings() -> dict:
     return {
         "source_lead_weeks": dict(DEFAULT_SOURCE_LEAD_WEEKS),
         "safety_weeks_by_mover": dict(DEFAULT_SAFETY_WEEKS_BY_MOVER),
         "preferred_mill": ACTIVE_MILL,
         "future_mill": FUTURE_MILL,
+        "active_scenario": "Base",
     }
 
 
@@ -178,6 +284,7 @@ def load_settings() -> dict:
     defaults["safety_weeks_by_mover"].update(saved.get("safety_weeks_by_mover", {}))
     defaults["preferred_mill"] = saved.get("preferred_mill", ACTIVE_MILL) or ACTIVE_MILL
     defaults["future_mill"] = saved.get("future_mill", FUTURE_MILL) or FUTURE_MILL
+    defaults["active_scenario"] = saved.get("active_scenario", "Base") or "Base"
     return defaults
 
 
@@ -360,19 +467,68 @@ def choose_source(source_override: str, recommendation_qty: float, preferred_mil
     return preferred_mill
 
 
-def build_plan(snapshot: dict, overrides: dict, settings: dict) -> list[dict]:
+def normalize_forecast_entries(raw_payload: dict | list) -> list[dict]:
+    if isinstance(raw_payload, dict):
+        entries = raw_payload.get("entries", [])
+    elif isinstance(raw_payload, list):
+        entries = raw_payload
+    else:
+        entries = []
+    cleaned = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        size = clean_size(entry.get("size"))
+        month = clean_size(entry.get("month"))
+        scenario = clean_size(entry.get("scenario")) or "Base"
+        lbs = number(entry.get("monthly_lbs"))
+        if size and month:
+            cleaned.append(
+                {
+                    "size": size,
+                    "month": month,
+                    "scenario": scenario,
+                    "monthly_lbs": lbs,
+                    "note": clean_size(entry.get("note")),
+                }
+            )
+    return cleaned
+
+
+def build_future_demand_map(forecast_entries: list[dict], active_scenario: str) -> dict[str, dict]:
+    selected = [entry for entry in forecast_entries if entry.get("scenario") == active_scenario]
+    grouped: dict[str, list[dict]] = {}
+    for entry in selected:
+        grouped.setdefault(entry["size"], []).append(entry)
+    result: dict[str, dict] = {}
+    for size, entries in grouped.items():
+        sorted_entries = sorted(entries, key=lambda item: item["month"])
+        monthly_values = [number(item.get("monthly_lbs")) for item in sorted_entries]
+        result[size] = {
+            "future_monthly_lbs": sum(monthly_values) / len(monthly_values) if monthly_values else 0.0,
+            "future_total_lbs": sum(monthly_values),
+            "future_month_count": len(monthly_values),
+            "future_months": ", ".join(item["month"] for item in sorted_entries[:6]),
+        }
+    return result
+
+
+def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries: list[dict]) -> list[dict]:
     items = snapshot.get("items", [])
     lead_weeks = settings.get("source_lead_weeks", {})
     safety_by_mover = settings.get("safety_weeks_by_mover", {})
     preferred_mill = settings.get("preferred_mill", ACTIVE_MILL)
     future_mill = settings.get("future_mill", FUTURE_MILL)
+    active_scenario = settings.get("active_scenario", "Base")
+    future_demand_map = build_future_demand_map(forecast_entries, active_scenario)
     mover_map = classify_movers(items)
     planning_rows = []
     for item in items:
         override = overrides.get(item["size"], {})
         base_monthly_lbs = item.get("avg_monthly_lbs") or round(item.get("adjusted_usage_7mo_lbs", 0.0) / 7.0, 2)
         manual_adjustment_lbs = float(override.get("manual_adjustment_lbs", 0.0) or 0.0)
-        forecast_monthly_lbs = max(0.0, base_monthly_lbs + manual_adjustment_lbs)
+        future_sales_lbs = future_demand_map.get(item["size"], {}).get("future_monthly_lbs", 0.0)
+        forecast_monthly_lbs = max(0.0, base_monthly_lbs + manual_adjustment_lbs + future_sales_lbs)
         weekly_usage = forecast_monthly_lbs / 4.345 if forecast_monthly_lbs else 0.0
         mover_class = mover_map.get(item["size"], "Slow")
         safety_weeks = float(safety_by_mover.get(mover_class, DEFAULT_SAFETY_WEEKS_BY_MOVER[mover_class]))
@@ -416,6 +572,7 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict) -> list[dict]:
                 "mover_class": mover_class,
                 "base_monthly_lbs": base_monthly_lbs,
                 "manual_adjustment_lbs": manual_adjustment_lbs,
+                "future_sales_monthly_lbs": future_sales_lbs,
                 "forecast_monthly_lbs": forecast_monthly_lbs,
                 "plant_available_lbs": plant_available_lbs,
                 "dc_on_hand_lbs": dc_on_hand_lbs,
@@ -436,6 +593,8 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict) -> list[dict]:
                 "override_note": override.get("note", "").strip(),
                 "preferred_mill": preferred_mill,
                 "future_mill": future_mill,
+                "active_scenario": active_scenario,
+                "future_sales_months": future_demand_map.get(item["size"], {}).get("future_months", ""),
             }
         )
     return sorted(planning_rows, key=planning_sort_key)
@@ -505,6 +664,7 @@ def render_dashboard(plan_rows: list[dict], snapshot: dict, settings: dict) -> N
         st.markdown("#### Planning Rules")
         st.write(f"Preferred direct mill: {settings.get('preferred_mill', ACTIVE_MILL)}")
         st.write(f"Future mill: {settings.get('future_mill', FUTURE_MILL)}")
+        st.write(f"Active scenario: {settings.get('active_scenario', 'Base')}")
         st.write("Distribution centers are used as safety coverage when plant supply gets too tight.")
         st.write(f"Latest import: {snapshot.get('imported_at', 'Not loaded')}")
     chart_data = {row["size"]: row["recommended_order_lbs"] for row in plan_rows if row["recommended_order_lbs"] > 0}
@@ -541,6 +701,9 @@ def render_items(plan_rows: list[dict]) -> None:
     bottom[3].metric("Recommended qty", f"{row['recommended_order_lbs']:,.0f} lbs")
     if row["override_note"]:
         st.info(f"Planner note: {row['override_note']}")
+    st.write(f"Future sales demand added: {row['future_sales_monthly_lbs']:,.0f} lbs / month")
+    if row["future_sales_months"]:
+        st.write(f"Sales months in scenario: {row['future_sales_months']}")
 
 
 def render_supply_plan(plan_rows: list[dict]) -> None:
@@ -580,6 +743,7 @@ def render_recommendations(plan_rows: list[dict]) -> None:
             "Qty (lbs)": round(row["recommended_order_lbs"], 0),
             "Reorder Point": round(row["reorder_point_lbs"], 0),
             "Target Stock": round(row["target_stock_lbs"], 0),
+            "Scenario": row["active_scenario"],
             "Reason": row["recommendation_reason"],
         }
         for row in plan_rows
@@ -656,6 +820,11 @@ def render_settings(settings: dict) -> None:
             [FUTURE_MILL, ACTIVE_MILL],
             index=[FUTURE_MILL, ACTIVE_MILL].index(settings.get("future_mill", FUTURE_MILL)),
         )
+        active_scenario = st.selectbox(
+            "Active demand scenario",
+            ["Base", "Upside", "Downside"],
+            index=["Base", "Upside", "Downside"].index(settings.get("active_scenario", "Base")),
+        )
         st.markdown("#### Lead Times (weeks)")
         lead_col1, lead_col2, lead_col3, lead_col4 = st.columns(4)
         tecnofil_weeks = lead_col1.number_input(
@@ -702,6 +871,7 @@ def render_settings(settings: dict) -> None:
             {
                 "preferred_mill": preferred_mill,
                 "future_mill": future_mill,
+                "active_scenario": active_scenario,
                 "source_lead_weeks": {
                     "Tecnofil": tecnofil_weeks,
                     "Coppr Rod": coppr_rod_weeks,
@@ -756,22 +926,139 @@ def render_import(snapshot: dict) -> None:
         st.info("No workbook has been loaded yet.")
 
 
+def render_future_demand(plan_rows: list[dict], forecast_entries: list[dict]) -> None:
+    st.markdown("#### Future Demand Plan")
+    if not plan_rows:
+        st.info("Load your workbook first so the app knows which copper sizes are active.")
+        return
+
+    size_options = [row["size"] for row in plan_rows]
+    with st.form("future_demand_form"):
+        entry_cols = st.columns(4)
+        selected_size = entry_cols[0].selectbox("Copper size", size_options)
+        scenario = entry_cols[1].selectbox("Scenario", ["Base", "Upside", "Downside"])
+        month_date = entry_cols[2].date_input("Month", value=datetime.today().date().replace(day=1))
+        monthly_lbs = entry_cols[3].number_input("Monthly lbs", min_value=0.0, step=100.0)
+        note = st.text_area("Sales note", height=90)
+        submitted = st.form_submit_button("Add demand entry")
+
+    entries_payload = {"entries": list(forecast_entries)}
+    if submitted:
+        month_value = month_date.strftime("%Y-%m")
+        replaced = False
+        for entry in entries_payload["entries"]:
+            if entry["size"] == selected_size and entry["scenario"] == scenario and entry["month"] == month_value:
+                entry["monthly_lbs"] = monthly_lbs
+                entry["note"] = note.strip()
+                replaced = True
+                break
+        if not replaced:
+            entries_payload["entries"].append(
+                {
+                    "size": selected_size,
+                    "scenario": scenario,
+                    "month": month_value,
+                    "monthly_lbs": monthly_lbs,
+                    "note": note.strip(),
+                }
+            )
+        save_json(FORECASTS_PATH, entries_payload)
+        st.success(f"Saved {scenario} demand for {selected_size} in {month_value}.")
+        st.rerun()
+
+    st.caption("These entries represent future sales or commercial demand not visible in history yet.")
+    if forecast_entries:
+        rows = [
+            {
+                "Copper Size": entry["size"],
+                "Scenario": entry["scenario"],
+                "Month": entry["month"],
+                "Monthly lbs": entry["monthly_lbs"],
+                "Note": entry.get("note", ""),
+            }
+            for entry in sorted(forecast_entries, key=lambda item: (item["scenario"], item["month"], item["size"]))
+        ]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("No future sales demand entries have been added yet.")
+
+
+def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecast_entries: list[dict]) -> None:
+    config = get_supabase_config()
+    st.markdown("#### Supabase Connection")
+    if config["enabled"]:
+        st.success("Supabase configuration detected.")
+        st.write(f"Project URL: {config['url']}")
+    else:
+        st.warning("Supabase is not configured in this app yet.")
+        st.code(
+            "\n".join(
+                [
+                    'SUPABASE_URL = "https://your-project.supabase.co"',
+                    'SUPABASE_PUBLISHABLE_KEY = "sb_publishable_..."',
+                ]
+            ),
+            language="toml",
+        )
+        st.caption("Add these to Streamlit Cloud secrets or local environment variables.")
+
+    st.markdown("#### Required Supabase Table")
+    st.caption("Run this once in the Supabase SQL Editor to create the simple app state table.")
+    st.code(get_supabase_sql_setup(), language="sql")
+
+    if not config["enabled"]:
+        return
+
+    col1, col2 = st.columns(2)
+    if col1.button("Sync local app state to Supabase", use_container_width=True):
+        try:
+            upsert_supabase_state(config, "snapshot", snapshot)
+            upsert_supabase_state(config, "overrides", overrides)
+            upsert_supabase_state(config, "settings", settings)
+            upsert_supabase_state(config, "future_demand", {"entries": forecast_entries})
+            st.success("Synced snapshot, overrides, settings, and future demand to Supabase.")
+        except requests.RequestException as exc:
+            st.error(f"Supabase sync failed: {exc}")
+
+    if col2.button("Load app state from Supabase", use_container_width=True):
+        try:
+            remote_snapshot = fetch_supabase_state(config, "snapshot")
+            remote_overrides = fetch_supabase_state(config, "overrides")
+            remote_settings = fetch_supabase_state(config, "settings")
+            remote_future_demand = fetch_supabase_state(config, "future_demand")
+            if remote_snapshot:
+                save_json(STATE_PATH, remote_snapshot)
+            if remote_overrides:
+                save_json(OVERRIDES_PATH, remote_overrides)
+            if remote_settings:
+                save_json(SETTINGS_PATH, remote_settings)
+            if remote_future_demand:
+                save_json(FORECASTS_PATH, remote_future_demand)
+            st.success("Loaded available state from Supabase.")
+            st.rerun()
+        except requests.RequestException as exc:
+            st.error(f"Supabase load failed: {exc}")
+
+
 def main() -> None:
     inject_styles()
     snapshot = load_json(STATE_PATH)
     overrides = load_json(OVERRIDES_PATH)
     settings = load_settings()
-    plan_rows = build_plan(snapshot, overrides, settings)
+    forecast_entries = normalize_forecast_entries(load_json(FORECASTS_PATH))
+    plan_rows = build_plan(snapshot, overrides, settings, forecast_entries)
     render_hero(snapshot, plan_rows)
-    dashboard_tab, items_tab, supply_tab, reorder_tab, overrides_tab, settings_tab, import_tab = st.tabs(
+    dashboard_tab, items_tab, supply_tab, reorder_tab, future_tab, overrides_tab, settings_tab, import_tab, supabase_tab = st.tabs(
         [
             "Dashboard",
             "Copper Items",
             "Supply Plan",
             "Reorder Recommendations",
+            "Future Demand Plan",
             "Manual Forecast Overrides",
             "Planning Settings",
             "Data Import / Refresh",
+            "Supabase Sync",
         ]
     )
     with dashboard_tab:
@@ -782,12 +1069,16 @@ def main() -> None:
         render_supply_plan(plan_rows)
     with reorder_tab:
         render_recommendations(plan_rows)
+    with future_tab:
+        render_future_demand(plan_rows, forecast_entries)
     with overrides_tab:
         render_overrides(plan_rows, overrides)
     with settings_tab:
         render_settings(settings)
     with import_tab:
         render_import(snapshot)
+    with supabase_tab:
+        render_supabase_tab(snapshot, overrides, settings, forecast_entries)
 
 
 if __name__ == "__main__":

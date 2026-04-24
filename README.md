@@ -44,6 +44,19 @@ Cloud use:
 - `requirements.txt`: Minimal dependencies
 - `data/`: Saved import snapshot and manual overrides
 
+## Supabase
+
+This app can sync its saved forecast state to Supabase.
+
+Add these secrets in Streamlit Cloud:
+
+```toml
+SUPABASE_URL = "https://your-project.supabase.co"
+SUPABASE_PUBLISHABLE_KEY = "sb_publishable_..."
+```
+
+Then use the `Supabase Sync` tab in the app. The app includes the SQL needed to create the simple `app_state` table used for version 1 state storage.
+
 ## GitHub Note
 
 The local workbook `March Copper Review Final.xlsx` is excluded from Git by default so you can keep sensitive planning data out of the repository. Upload the workbook through the app after deployment.
