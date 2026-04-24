@@ -759,6 +759,71 @@ def render_recommendations(plan_rows: list[dict]) -> None:
         )
 
 
+def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: list[dict]) -> None:
+    st.markdown("#### Forecast Logic")
+    st.caption("This tab explains how the current planning engine is producing its recommendations.")
+
+    st.markdown("##### Current Planning Flow")
+    st.write("1. Import the copper workbook and identify active copper sizes.")
+    st.write("2. Use workbook average monthly usage as the base demand signal.")
+    st.write("3. Add manual overrides by copper size when planners know demand is changing.")
+    st.write("4. Add future demand entries from sales or commercial expectations by scenario.")
+    st.write("5. Convert monthly demand into weekly usage.")
+    st.write("6. Calculate plant available, DC inventory, and inbound supply.")
+    st.write("7. Calculate safety stock, reorder point, target stock, and recommended source.")
+    st.write("8. Classify each item into `Order Now`, `Pull From DC`, `Monitor`, `Healthy`, or `Excess Risk`.")
+
+    st.markdown("##### Current Formulas")
+    st.code(
+        "\n".join(
+            [
+                "forecast_monthly_lbs = base_monthly_lbs + manual_adjustment_lbs + future_sales_monthly_lbs",
+                "weekly_usage = forecast_monthly_lbs / 4.345",
+                "plant_available_lbs = icc_inventory_current_lbs - jobs_pending_lbs",
+                "dc_on_hand_lbs = williams_on_hand_lbs + maverick_on_hand_lbs",
+                "inbound_total_lbs = dc_on_order_lbs + mill_on_order_lbs",
+                "net_supply_lbs = plant_available_lbs + dc_on_hand_lbs + inbound_total_lbs",
+                "safety_stock_lbs = weekly_usage * safety_weeks",
+                "reorder_point_lbs = weekly_usage * preferred_mill_lead_weeks + safety_stock_lbs",
+                "target_stock_lbs = weekly_usage * (preferred_mill_lead_weeks + safety_weeks + 4)",
+                "recommended_order_lbs = max(0, target_stock_lbs - net_supply_lbs)",
+            ]
+        ),
+        language="text",
+    )
+
+    st.markdown("##### Current Action Rules")
+    st.write("`Pull From DC`: plant available is below about 4 weeks of usage and distribution has stock.")
+    st.write("`Order Now`: net supply is below reorder point.")
+    st.write("`Excess Risk`: net supply is well above target stock.")
+    st.write("`Monitor`: item is above reorder point now but still has a positive suggested buy gap.")
+    st.write("`Healthy`: item is inside the current target range.")
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.markdown("##### Live Assumptions")
+        st.write(f"Preferred mill: {settings.get('preferred_mill', ACTIVE_MILL)}")
+        st.write(f"Future mill: {settings.get('future_mill', FUTURE_MILL)}")
+        st.write(f"Active scenario: {settings.get('active_scenario', 'Base')}")
+        st.write("Lead times (weeks):")
+        for source_name, weeks in settings.get("source_lead_weeks", {}).items():
+            st.write(f"- {source_name}: {weeks}")
+    with right_col:
+        st.markdown("##### Current State")
+        st.write("Safety stock by mover (weeks):")
+        for mover_name, weeks in settings.get("safety_weeks_by_mover", {}).items():
+            st.write(f"- {mover_name}: {weeks}")
+        st.write(f"Future demand entries loaded: {len(forecast_entries)}")
+        st.write(f"Items currently in plan: {len(plan_rows)}")
+
+    st.markdown("##### What This Version Does Not Do Yet")
+    st.write("`Production schedule demand` is not yet loaded separately from history.")
+    st.write("`Weighted sales pipeline logic` is not built yet.")
+    st.write("`True week-by-week depletion modeling` is not built yet.")
+    st.write("`Supplier MOQ, lot size, and price break logic` are not built yet.")
+    st.write("`ERP API automation` is not built yet.")
+
+
 def render_overrides(plan_rows: list[dict], overrides: dict) -> None:
     if not plan_rows:
         st.info("Load data before editing overrides.")
@@ -1048,12 +1113,13 @@ def main() -> None:
     forecast_entries = normalize_forecast_entries(load_json(FORECASTS_PATH))
     plan_rows = build_plan(snapshot, overrides, settings, forecast_entries)
     render_hero(snapshot, plan_rows)
-    dashboard_tab, items_tab, supply_tab, reorder_tab, future_tab, overrides_tab, settings_tab, import_tab, supabase_tab = st.tabs(
+    dashboard_tab, items_tab, supply_tab, reorder_tab, logic_tab, future_tab, overrides_tab, settings_tab, import_tab, supabase_tab = st.tabs(
         [
             "Dashboard",
             "Copper Items",
             "Supply Plan",
             "Reorder Recommendations",
+            "Logic",
             "Future Demand Plan",
             "Manual Forecast Overrides",
             "Planning Settings",
@@ -1069,6 +1135,8 @@ def main() -> None:
         render_supply_plan(plan_rows)
     with reorder_tab:
         render_recommendations(plan_rows)
+    with logic_tab:
+        render_logic_tab(settings, plan_rows, forecast_entries)
     with future_tab:
         render_future_demand(plan_rows, forecast_entries)
     with overrides_tab:
