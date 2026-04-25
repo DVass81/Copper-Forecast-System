@@ -335,6 +335,12 @@ def build_default_settings() -> dict:
             "distribution": 10000.0,
         },
         "confidence_weights": dict(CONFIDENCE_WEIGHTS),
+        "dc_release_date": "2026-07-31",
+        "dc_target_lbs_by_mover": {
+            "Fast": 3000.0,
+            "Medium": 3000.0,
+            "Slow": 1000.0,
+        },
     }
 
 
@@ -350,6 +356,8 @@ def load_settings() -> dict:
     defaults["weekly_demand_profile"] = saved.get("weekly_demand_profile", "Front-loaded") or "Front-loaded"
     defaults["source_moq_lbs"].update(saved.get("source_moq_lbs", {}))
     defaults["confidence_weights"].update(saved.get("confidence_weights", {}))
+    defaults["dc_release_date"] = saved.get("dc_release_date", "2026-07-31") or "2026-07-31"
+    defaults["dc_target_lbs_by_mover"].update(saved.get("dc_target_lbs_by_mover", {}))
     return defaults
 
 
@@ -636,6 +644,17 @@ def format_date_from_weeks(weeks_from_now: float) -> str:
     return target.strftime("%Y-%m-%d")
 
 
+def parse_date_string(value: str, fallback: datetime | None = None) -> datetime:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return fallback or datetime.today()
+
+
+def target_dc_lbs_for_mover(mover_class: str, settings: dict) -> float:
+    return number(settings.get("dc_target_lbs_by_mover", {}).get(mover_class, 1000.0))
+
+
 def recommendation_timing(row: dict, settings: dict) -> tuple[str, str]:
     source_name = row.get("recommended_source", settings.get("preferred_mill", ACTIVE_MILL))
     if source_name in DIST_SOURCES:
@@ -674,13 +693,15 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
         weekly_usage = forecast_monthly_lbs / 4.345 if forecast_monthly_lbs else 0.0
         mover_class = mover_map.get(item["size"], "Slow")
         safety_weeks = float(safety_by_mover.get(mover_class, DEFAULT_SAFETY_WEEKS_BY_MOVER[mover_class]))
+        dc_target_lbs = target_dc_lbs_for_mover(mover_class, settings)
 
         plant_available_lbs = max(0.0, item.get("icc_inventory_current_lbs", 0.0) - item.get("jobs_pending_lbs", 0.0))
         dc_on_hand_lbs = item.get("williams_on_hand_lbs", 0.0) + item.get("maverick_on_hand_lbs", 0.0)
         dc_on_order_lbs = item.get("williams_on_order_lbs", 0.0) + item.get("maverick_on_order_lbs", 0.0)
         mill_on_order_lbs = item.get("tecnofil_on_order_lbs", 0.0)
         inbound_total_lbs = dc_on_order_lbs + mill_on_order_lbs
-        current_supply_lbs = plant_available_lbs + dc_on_hand_lbs
+        dc_over_target_lbs = max(0.0, dc_on_hand_lbs - dc_target_lbs)
+        current_supply_lbs = plant_available_lbs + dc_over_target_lbs
         net_supply_lbs = current_supply_lbs + inbound_total_lbs
 
         safety_stock_lbs = weekly_usage * safety_weeks
@@ -723,6 +744,8 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
                 "forecast_monthly_lbs": forecast_monthly_lbs,
                 "plant_available_lbs": plant_available_lbs,
                 "dc_on_hand_lbs": dc_on_hand_lbs,
+                "dc_target_lbs": dc_target_lbs,
+                "dc_over_target_lbs": dc_over_target_lbs,
                 "dc_on_order_lbs": dc_on_order_lbs,
                 "mill_on_order_lbs": mill_on_order_lbs,
                 "inbound_total_lbs": inbound_total_lbs,
@@ -794,13 +817,18 @@ def build_weekly_projection(plan_row: dict, forecast_entries: list[dict], large_
     horizon_weeks = int(settings.get("planning_horizon_weeks", 26) or 26)
     today_week = start_of_week(datetime.today())
     monthly_demand_map = get_monthly_demand_map(plan_row, forecast_entries, large_job_entries, settings)
-    total_supply = number(plan_row.get("plant_available_lbs", 0.0)) + number(plan_row.get("dc_on_hand_lbs", 0.0))
+    total_supply = number(plan_row.get("plant_available_lbs", 0.0))
+    dc_on_hand_lbs = number(plan_row.get("dc_on_hand_lbs", 0.0))
+    dc_target_lbs = number(plan_row.get("dc_target_lbs", 0.0))
     inbound_events = {
         int(round(number(settings["source_lead_weeks"].get(settings.get("preferred_mill", ACTIVE_MILL), 11.0)))): number(
             plan_row.get("mill_on_order_lbs", 0.0)
         ),
         int(round(number(settings["source_lead_weeks"].get("Williams", 13.0)))): number(plan_row.get("dc_on_order_lbs", 0.0)),
     }
+    dc_release_date = parse_date_string(settings.get("dc_release_date", "2026-07-31"))
+    dc_release_week = start_of_week(dc_release_date)
+    dc_release_lbs = max(0.0, dc_on_hand_lbs - dc_target_lbs)
     week_starts = [today_week + timedelta(weeks=week_index) for week_index in range(horizon_weeks)]
     month_groups: dict[str, list[datetime]] = {}
     for week_start in week_starts:
@@ -819,6 +847,9 @@ def build_weekly_projection(plan_row: dict, forecast_entries: list[dict], large_
         monthly_lbs = number(monthly_demand_map.get(month_key, plan_row.get("forecast_monthly_lbs", 0.0)))
         weekly_demand = monthly_lbs * month_profiles[month_key][week_index_in_month]
         inbound_lbs = number(inbound_events.get(week_index, 0.0))
+        if week_start >= dc_release_week and dc_release_lbs > 0:
+            inbound_lbs += dc_release_lbs
+            dc_release_lbs = 0.0
         opening_supply = running_supply
         closing_supply = opening_supply + inbound_lbs - weekly_demand
         if stockout_week is None and closing_supply < 0:
@@ -994,6 +1025,8 @@ def render_items(plan_rows: list[dict]) -> None:
     if row.get("future_confidence_mix"):
         st.write(f"Sales confidence mix: {row['future_confidence_mix']}")
     st.write(f"Large-job demand added: {row.get('large_job_monthly_lbs', 0.0):,.0f} lbs / month")
+    st.write(f"DC target buffer: {row.get('dc_target_lbs', 0.0):,.0f} lbs")
+    st.write(f"DC release to ICC on release date: {row.get('dc_over_target_lbs', 0.0):,.0f} lbs")
     if row.get("moq_note"):
         st.write(f"MOQ rule: {row['moq_note']}")
     st.write(f"Order by: {row.get('order_by_date', 'Now')}")
@@ -1010,6 +1043,8 @@ def render_supply_plan(plan_rows: list[dict]) -> None:
             "Mover": row["mover_class"],
             "Plant Available": round(row["plant_available_lbs"], 0),
             "DC On Hand": round(row["dc_on_hand_lbs"], 0),
+            "DC Target": round(row["dc_target_lbs"], 0),
+            "DC Release Qty": round(row["dc_over_target_lbs"], 0),
             "Inbound Total": round(row["inbound_total_lbs"], 0),
             "Forecast / Month": round(row["forecast_monthly_lbs"], 0),
             "Current Coverage": round(row["current_coverage_weeks"], 1),
@@ -1066,8 +1101,9 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
     st.write("4. Add future demand entries from sales or commercial expectations by scenario.")
     st.write("5. Convert monthly demand into weekly usage.")
     st.write("6. Calculate plant available, DC inventory, and inbound supply.")
-    st.write("7. Calculate safety stock, reorder point, target stock, and recommended source.")
-    st.write("8. Classify each item into `Order Now`, `Pull From DC`, `Monitor`, `Healthy`, or `Excess Risk`.")
+    st.write("7. Treat DC stock above the target buffer as temporary release stock that moves to ICC on the release date.")
+    st.write("8. Calculate safety stock, reorder point, target stock, and recommended source.")
+    st.write("9. Classify each item into `Order Now`, `Pull From DC`, `Monitor`, `Healthy`, or `Excess Risk`.")
 
     st.markdown("##### Current Formulas")
     st.code(
@@ -1079,8 +1115,9 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
                 "weekly_usage = forecast_monthly_lbs / 4.345",
                 "plant_available_lbs = icc_inventory_current_lbs - jobs_pending_lbs",
                 "dc_on_hand_lbs = williams_on_hand_lbs + maverick_on_hand_lbs",
+                "dc_over_target_lbs = max(0, dc_on_hand_lbs - dc_target_lbs)",
                 "inbound_total_lbs = dc_on_order_lbs + mill_on_order_lbs",
-                "net_supply_lbs = plant_available_lbs + dc_on_hand_lbs + inbound_total_lbs",
+                "net_supply_lbs = plant_available_lbs + dc_over_target_lbs + inbound_total_lbs",
                 "safety_stock_lbs = weekly_usage * safety_weeks",
                 "reorder_point_lbs = weekly_usage * preferred_mill_lead_weeks + safety_stock_lbs",
                 "target_stock_lbs = weekly_usage * (preferred_mill_lead_weeks + safety_weeks + 4)",
@@ -1103,6 +1140,7 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
         st.write(f"Preferred mill: {settings.get('preferred_mill', ACTIVE_MILL)}")
         st.write(f"Future mill: {settings.get('future_mill', FUTURE_MILL)}")
         st.write(f"Active scenario: {settings.get('active_scenario', 'Base')}")
+        st.write(f"DC release date: {settings.get('dc_release_date', '2026-07-31')}")
         st.write("Lead times (weeks):")
         for source_name, weeks in settings.get("source_lead_weeks", {}).items():
             st.write(f"- {source_name}: {weeks}")
@@ -1115,6 +1153,9 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
         st.write("MOQ rules:")
         st.write(f"- Direct mill: {number(moq_settings.get('direct_mill', 40000.0)):,.0f} lbs")
         st.write(f"- Distribution: {number(moq_settings.get('distribution', 10000.0)):,.0f} lbs")
+        st.write("DC target buffers:")
+        for mover_name, lbs in settings.get("dc_target_lbs_by_mover", {}).items():
+            st.write(f"- {mover_name}: {number(lbs):,.0f} lbs")
         st.write("Sales confidence weights:")
         for confidence, weight in settings.get("confidence_weights", {}).items():
             st.write(f"- {confidence}: {weight}")
@@ -1371,6 +1412,31 @@ def render_settings(settings: dict) -> None:
             index=list(WEEKLY_PROFILES).index(settings.get("weekly_demand_profile", "Front-loaded")),
             help="Use this to shape how monthly demand is distributed within each month.",
         )
+        dc_release_date = st.text_input(
+            "DC release date",
+            value=settings.get("dc_release_date", "2026-07-31"),
+            help="Inventory above the DC target buffer will be treated as releasing into ICC on this date.",
+        )
+        st.markdown("#### DC Target Buffers (lbs)")
+        dc_col1, dc_col2, dc_col3 = st.columns(3)
+        fast_dc_target = dc_col1.number_input(
+            "Fast movers DC target",
+            min_value=0.0,
+            value=float(settings.get("dc_target_lbs_by_mover", {}).get("Fast", 3000.0)),
+            step=500.0,
+        )
+        medium_dc_target = dc_col2.number_input(
+            "Medium movers DC target",
+            min_value=0.0,
+            value=float(settings.get("dc_target_lbs_by_mover", {}).get("Medium", 3000.0)),
+            step=500.0,
+        )
+        slow_dc_target = dc_col3.number_input(
+            "Slow movers DC target",
+            min_value=0.0,
+            value=float(settings.get("dc_target_lbs_by_mover", {}).get("Slow", 1000.0)),
+            step=500.0,
+        )
         st.markdown("#### MOQ Rules (lbs)")
         moq_col1, moq_col2 = st.columns(2)
         direct_mill_moq = moq_col1.number_input(
@@ -1457,6 +1523,12 @@ def render_settings(settings: dict) -> None:
                 "active_scenario": active_scenario,
                 "planning_horizon_weeks": int(planning_horizon_weeks),
                 "weekly_demand_profile": weekly_demand_profile,
+                "dc_release_date": dc_release_date.strip(),
+                "dc_target_lbs_by_mover": {
+                    "Fast": fast_dc_target,
+                    "Medium": medium_dc_target,
+                    "Slow": slow_dc_target,
+                },
                 "source_moq_lbs": {
                     "direct_mill": direct_mill_moq,
                     "distribution": distribution_moq,
