@@ -367,6 +367,17 @@ def resolve_default_workbook_path() -> Path:
     return ONEDRIVE_WORKBOOK_PATH
 
 
+def ensure_local_snapshot_exists() -> None:
+    if STATE_PATH.exists():
+        return
+    workbook_path = resolve_default_workbook_path()
+    if not workbook_path.exists():
+        return
+    snapshot = parse_workbook(workbook_path.read_bytes(), workbook_path.name)
+    save_json(STATE_PATH, snapshot)
+    append_import_history(snapshot)
+
+
 def clean_size(value: object) -> str:
     return str(value or "").strip()
 
@@ -1784,6 +1795,7 @@ def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecas
 
 def main() -> None:
     inject_styles()
+    ensure_local_snapshot_exists()
     snapshot = load_json(STATE_PATH)
     overrides = load_json(OVERRIDES_PATH)
     settings = load_settings()
