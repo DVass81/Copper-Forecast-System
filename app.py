@@ -1116,6 +1116,25 @@ def render_executive_summary(plan_rows: list[dict], snapshot: dict, settings: di
     st.write("4. Future sales demand and large jobs can be added before they show up in historical usage.")
     st.write("5. The structure is designed to evolve from workbook imports today to ERP/API inputs later.")
 
+    compare_col1, compare_col2 = st.columns(2)
+    with compare_col1:
+        st.markdown("##### Current State")
+        st.write("- Trailing-history-driven material review")
+        st.write("- Spreadsheet-based refreshes")
+        st.write("- Limited visibility to future risk by copper size")
+        st.write("- Outside inventory can overstate real long-term coverage")
+    with compare_col2:
+        st.markdown("##### Future State")
+        st.write("- Item-level copper planning by thickness and width")
+        st.write("- Time-phased weekly projection with inbound supply timing")
+        st.write("- Future demand, large jobs, and planner actions in one system")
+        st.write("- Ready for ERP/API automation when live feeds are available")
+
+    st.markdown("##### Inventory Philosophy")
+    st.write("1. Carry enough inventory in house to protect production, but avoid excess slow-mover inventory.")
+    st.write("2. Use DC as a controlled buffer, not as false permanent long-term coverage.")
+    st.write("3. Buy to protect lead time risk and production continuity, not just to react to past usage.")
+
     st.markdown("##### Current planning assumptions")
     st.write(f"- Preferred direct mill: {settings.get('preferred_mill', ACTIVE_MILL)}")
     st.write(f"- Active scenario: {settings.get('active_scenario', 'Base')}")
@@ -1220,6 +1239,32 @@ def render_recommendations(plan_rows: list[dict]) -> None:
             file_name="copper_recommendations.csv",
             mime="text/csv",
         )
+        selected_size = st.selectbox(
+            "Recommendation detail",
+            [row["size"] for row in plan_rows],
+            key="recommendation_detail_size",
+        )
+        selected_row = next(row for row in plan_rows if row["size"] == selected_size)
+        st.markdown(
+            """
+            <div class="section-card">
+                <strong>Why this recommendation exists</strong>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.write(f"- Copper size: {selected_row['size']}")
+        st.write(f"- Action: {selected_row['action_bucket']}")
+        st.write(f"- Recommended source: {selected_row['recommended_source']}")
+        st.write(f"- Recommended quantity: {selected_row['recommended_order_lbs']:,.0f} lbs")
+        st.write(f"- Forecast demand: {selected_row['forecast_monthly_lbs']:,.0f} lbs/month")
+        st.write(f"- Current coverage: {selected_row['current_coverage_weeks']:.1f} weeks")
+        st.write(f"- Net coverage: {selected_row['net_coverage_weeks']:.1f} weeks")
+        st.write(f"- Reorder point: {selected_row['reorder_point_lbs']:,.0f} lbs")
+        st.write(f"- Target stock: {selected_row['target_stock_lbs']:,.0f} lbs")
+        st.write(f"- Order by: {selected_row.get('order_by_date', 'Now')}")
+        st.write(f"- Expected receipt: {selected_row.get('expected_receipt_date', 'N/A')}")
+        st.write(f"- System reason: {selected_row['recommendation_reason']}")
 
 
 def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: list[dict]) -> None:
