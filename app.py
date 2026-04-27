@@ -20,6 +20,12 @@ ACTIONS_PATH = DATA_DIR / "copper_item_actions.json"
 LARGE_JOBS_PATH = DATA_DIR / "copper_large_jobs.json"
 REVIEW_HISTORY_PATH = DATA_DIR / "copper_review_history.json"
 LOCAL_WORKBOOK_PATH = APP_DIR / "March Copper Review Final.xlsx"
+LOGO_CANDIDATES = [
+    APP_DIR / "icc_logo.png",
+    APP_DIR / "icc_logo.jpg",
+    APP_DIR / "icc_logo.jpeg",
+    APP_DIR / "ICC Logo.png",
+]
 ONEDRIVE_WORKBOOK_PATH = (
     Path.home()
     / "OneDrive - Industrial Commutator Corporation, Inc"
@@ -74,12 +80,52 @@ def inject_styles() -> None:
             }
             .main {
                 background:
-                    radial-gradient(circle at top right, rgba(212, 171, 70, 0.14), transparent 28%),
+                    radial-gradient(circle at top right, rgba(201, 166, 91, 0.16), transparent 28%),
                     linear-gradient(180deg, #f5f8fc 0%, #eef3f8 100%);
             }
+            .brand-shell {
+                display: flex;
+                align-items: center;
+                gap: 1rem;
+                margin-bottom: 0.8rem;
+                padding: 0.6rem 0.8rem;
+                background: rgba(255,255,255,0.82);
+                border: 1px solid #d7e0e7;
+                border-radius: 18px;
+                box-shadow: 0 10px 22px rgba(18, 54, 75, 0.06);
+            }
+            .brand-mark {
+                min-width: 92px;
+                min-height: 68px;
+                border-radius: 16px;
+                background:
+                    radial-gradient(circle at 18% 50%, rgba(201,166,91,0.42) 0%, rgba(201,166,91,0.10) 36%, transparent 37%),
+                    linear-gradient(135deg, #005b9a 0%, #0f2743 100%);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: inset 0 0 0 1px rgba(201,166,91,0.22);
+            }
+            .brand-mark span {
+                color: #ffffff;
+                font-size: 2rem;
+                font-weight: 900;
+                letter-spacing: 0.04em;
+                line-height: 1;
+            }
+            .brand-copy h2 {
+                margin: 0;
+                color: #005b9a;
+                font-size: 1.15rem;
+            }
+            .brand-copy p {
+                margin: 0.2rem 0 0 0;
+                color: #506777;
+                font-size: 0.92rem;
+            }
             .hero-card {
-                background: linear-gradient(135deg, #123c6b 0%, #0f2743 100%);
-                border: 1px solid rgba(214, 171, 70, 0.35);
+                background: linear-gradient(135deg, #005b9a 0%, #0f2743 100%);
+                border: 1px solid rgba(201, 166, 91, 0.38);
                 border-radius: 24px;
                 padding: 1.35rem 1.45rem;
                 margin-bottom: 1rem;
@@ -99,13 +145,13 @@ def inject_styles() -> None:
             .mini-card {
                 background: rgba(255, 255, 255, 0.94);
                 border: 1px solid #d7e0e7;
-                border-top: 4px solid #d6ab46;
+                border-top: 4px solid #c9a65b;
                 border-radius: 18px;
                 padding: 0.9rem 1rem;
                 box-shadow: 0 10px 24px rgba(18, 54, 75, 0.08);
             }
             .mini-card strong {
-                color: #123c6b;
+                color: #005b9a;
                 font-size: 1.4rem;
             }
             .section-card {
@@ -117,15 +163,15 @@ def inject_styles() -> None:
                 margin-bottom: 1rem;
             }
             .kpi-card {
-                background: linear-gradient(180deg, rgba(18, 60, 107, 0.98) 0%, rgba(15, 39, 67, 0.98) 100%);
-                border: 1px solid rgba(214, 171, 70, 0.38);
+                background: linear-gradient(180deg, rgba(0, 91, 154, 0.98) 0%, rgba(15, 39, 67, 0.98) 100%);
+                border: 1px solid rgba(201, 166, 91, 0.38);
                 border-radius: 18px;
                 padding: 1rem;
                 box-shadow: 0 10px 24px rgba(8, 26, 44, 0.14);
                 margin-bottom: 0.85rem;
             }
             .kpi-value {
-                color: #f0c75e;
+                color: #f3cd73;
                 font-size: 1.65rem;
                 font-weight: 800;
                 line-height: 1.1;
@@ -136,8 +182,8 @@ def inject_styles() -> None:
                 margin-top: 0.25rem;
             }
             .item-hero {
-                background: linear-gradient(135deg, #123c6b 0%, #0f2743 100%);
-                border: 1px solid rgba(214, 171, 70, 0.35);
+                background: linear-gradient(135deg, #005b9a 0%, #0f2743 100%);
+                border: 1px solid rgba(201, 166, 91, 0.35);
                 border-radius: 18px;
                 padding: 1rem 1.15rem;
                 margin: 0 0 1rem 0;
@@ -365,6 +411,13 @@ def resolve_default_workbook_path() -> Path:
     if LOCAL_WORKBOOK_PATH.exists():
         return LOCAL_WORKBOOK_PATH
     return ONEDRIVE_WORKBOOK_PATH
+
+
+def resolve_logo_path() -> Path | None:
+    for path in LOGO_CANDIDATES:
+        if path.exists():
+            return path
+    return None
 
 
 def ensure_local_snapshot_exists() -> None:
@@ -930,6 +983,36 @@ def build_exception_rows(plan_rows: list[dict], forecast_entries: list[dict], la
 
 
 def render_hero(snapshot: dict, plan_rows: list[dict]) -> None:
+    logo_path = resolve_logo_path()
+    if logo_path:
+        brand_col1, brand_col2 = st.columns([0.16, 0.84])
+        with brand_col1:
+            st.image(str(logo_path), width=120)
+        with brand_col2:
+            st.markdown(
+                """
+                <div class="brand-shell">
+                    <div class="brand-copy">
+                        <h2>ICC International</h2>
+                        <p>Copper planning prototype designed for leadership visibility, buyer action, and future ERP/API readiness.</p>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown(
+            """
+            <div class="brand-shell">
+                <div class="brand-mark"><span>ICC</span></div>
+                <div class="brand-copy">
+                    <h2>ICC International</h2>
+                    <p>Copper planning prototype designed for leadership visibility, buyer action, and future ERP/API readiness.</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     st.markdown(
         """
         <div class="hero-card">
@@ -1000,6 +1083,44 @@ def render_dashboard(plan_rows: list[dict], snapshot: dict, settings: dict) -> N
     if chart_data:
         st.markdown("#### Top Recommended Buys")
         st.bar_chart(chart_data)
+
+
+def render_executive_summary(plan_rows: list[dict], snapshot: dict, settings: dict) -> None:
+    st.markdown("#### Executive Summary")
+    if not plan_rows:
+        st.info("Load the workbook first so the executive summary can show live planning metrics.")
+        return
+    shortage_rows = [row for row in plan_rows if row["action_bucket"] in {"Order Now", "Pull From DC"}]
+    excess_rows = [row for row in plan_rows if row["action_bucket"] == "Excess Risk"]
+    direct_rows = [row for row in shortage_rows if row["recommended_source"] not in DIST_SOURCES]
+    dc_rows = [row for row in shortage_rows if row["recommended_source"] in DIST_SOURCES]
+    st.markdown(
+        """
+        <div class="section-card">
+            <strong>What this system does</strong><br>
+            Combines current inventory, DC inventory, inbound supply, lead times, MOQ rules, future demand, and non-linear weekly usage to recommend when to buy copper and where to source it.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("Urgent actions", len(shortage_rows))
+    summary_cols[1].metric("Direct mill actions", len(direct_rows))
+    summary_cols[2].metric("DC actions", len(dc_rows))
+    summary_cols[3].metric("Excess reviews", len(excess_rows))
+
+    st.markdown("##### Key talking points")
+    st.write("1. Forecasting is performed by copper size, not just total pounds, because stockout risk happens at the item level.")
+    st.write("2. The model uses source-specific lead times and MOQ rules, so recommendations align with real purchasing constraints.")
+    st.write("3. DC inventory is no longer treated as permanent supply; it follows a release-date and target-buffer logic.")
+    st.write("4. Future sales demand and large jobs can be added before they show up in historical usage.")
+    st.write("5. The structure is designed to evolve from workbook imports today to ERP/API inputs later.")
+
+    st.markdown("##### Current planning assumptions")
+    st.write(f"- Preferred direct mill: {settings.get('preferred_mill', ACTIVE_MILL)}")
+    st.write(f"- Active scenario: {settings.get('active_scenario', 'Base')}")
+    st.write(f"- DC release date: {settings.get('dc_release_date', '2026-07-31')}")
+    st.write(f"- Last imported workbook snapshot: {snapshot.get('imported_at', 'Not loaded')}")
 
 
 def render_items(plan_rows: list[dict]) -> None:
@@ -1803,8 +1924,9 @@ def main() -> None:
     large_job_entries = normalize_large_job_entries(load_json(LARGE_JOBS_PATH))
     plan_rows = build_plan(snapshot, overrides, settings, forecast_entries, large_job_entries)
     render_hero(snapshot, plan_rows)
-    dashboard_tab, items_tab, projection_tab, exceptions_tab, compare_tab, supply_tab, reorder_tab, logic_tab, future_tab, large_jobs_tab, actions_tab, review_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
+    summary_tab, dashboard_tab, items_tab, projection_tab, exceptions_tab, compare_tab, supply_tab, reorder_tab, logic_tab, future_tab, large_jobs_tab, actions_tab, review_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
         [
+            "Executive Summary",
             "Dashboard",
             "Copper Items",
             "Weekly Projection",
@@ -1824,6 +1946,8 @@ def main() -> None:
             "Supabase Sync",
         ]
     )
+    with summary_tab:
+        render_executive_summary(plan_rows, snapshot, settings)
     with dashboard_tab:
         render_dashboard(plan_rows, snapshot, settings)
     with items_tab:
