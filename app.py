@@ -611,16 +611,35 @@ def apply_moq_to_recommendation(
 ) -> tuple[float, str]:
     if recommendation_qty <= 0 or recommended_source == "None":
         return 0.0, ""
-    moq_settings = settings.get("source_moq_lbs", {})
-    if recommended_source in DIST_SOURCES:
-        moq = number(moq_settings.get("distribution", moq_settings.get("distribution_lbs", 10000.0)))
-        if 0 < recommendation_qty < moq:
-            return moq, f"Raised to distribution MOQ of {moq:,.0f} lbs."
-        return recommendation_qty, ""
-    moq = number(moq_settings.get("direct_mill", moq_settings.get("direct_mill_lbs", 40000.0)))
-    if 0 < recommendation_qty < moq:
-        return moq, f"Raised to direct mill MOQ of {moq:,.0f} lbs."
     return recommendation_qty, ""
+
+
+def summarize_order_baskets(plan_rows: list[dict], settings: dict) -> list[dict]:
+    moq_settings = settings.get("source_moq_lbs", {})
+    source_groups: dict[str, list[dict]] = {}
+    for row in plan_rows:
+        source = row.get("recommended_source", "None")
+        if source == "None" or number(row.get("recommended_order_lbs", 0.0)) <= 0:
+            continue
+        group_key = "Distribution" if source in DIST_SOURCES else source
+        source_groups.setdefault(group_key, []).append(row)
+
+    summaries = []
+    for source, rows in source_groups.items():
+        total_lbs = sum(number(row.get("recommended_order_lbs", 0.0)) for row in rows)
+        moq = number(moq_settings.get("distribution", 10000.0)) if source == "Distribution" else number(moq_settings.get("direct_mill", 40000.0))
+        gap = max(0.0, moq - total_lbs)
+        summaries.append(
+            {
+                "Source Basket": source,
+                "SKUs in Basket": len(rows),
+                "Recommended Total (lbs)": round(total_lbs, 0),
+                "MOQ (lbs)": round(moq, 0),
+                "MOQ Gap (lbs)": round(gap, 0),
+                "Meets MOQ": "Yes" if gap <= 0 else "No",
+            }
+        )
+    return summaries
 
 
 def normalize_forecast_entries(raw_payload: dict | list) -> list[dict]:
@@ -1211,6 +1230,11 @@ def render_recommendations(plan_rows: list[dict]) -> None:
     if not plan_rows:
         st.info("No recommendations yet.")
         return
+    basket_summary = summarize_order_baskets(plan_rows, load_settings())
+    if basket_summary:
+        st.markdown("#### Source Order Basket Summary")
+        st.caption("MOQ is evaluated at the source order total level, not per individual copper size.")
+        st.dataframe(basket_summary, use_container_width=True, hide_index=True)
     filter_value = st.selectbox(
         "Recommendation filter",
         ["All", "Order Now", "Pull From DC", "Excess Risk", "Monitor", "Healthy"],
@@ -1299,6 +1323,7 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
                 "reorder_point_lbs = weekly_usage * preferred_mill_lead_weeks + safety_stock_lbs",
                 "target_stock_lbs = weekly_usage * (preferred_mill_lead_weeks + safety_weeks + 4)",
                 "recommended_order_lbs = max(0, target_stock_lbs - net_supply_lbs)",
+                "MOQ is checked at the total source order basket level, not per SKU line",
             ]
         ),
         language="text",
@@ -1330,6 +1355,7 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
         st.write("MOQ rules:")
         st.write(f"- Direct mill: {number(moq_settings.get('direct_mill', 40000.0)):,.0f} lbs")
         st.write(f"- Distribution: {number(moq_settings.get('distribution', 10000.0)):,.0f} lbs")
+        st.write("- MOQ applies to the combined order basket by source, not each individual SKU.")
         st.write("DC target buffers:")
         for mover_name, lbs in settings.get("dc_target_lbs_by_mover", {}).items():
             st.write(f"- {mover_name}: {number(lbs):,.0f} lbs")
