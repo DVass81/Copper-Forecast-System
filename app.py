@@ -376,6 +376,7 @@ def build_default_settings() -> dict:
         "active_scenario": "Base",
         "planning_horizon_weeks": 26,
         "weekly_demand_profile": "Front-loaded",
+        "monthly_review_day": 1,
         "source_moq_lbs": {
             "direct_mill": 40000.0,
             "distribution": 10000.0,
@@ -400,6 +401,7 @@ def load_settings() -> dict:
     defaults["active_scenario"] = saved.get("active_scenario", "Base") or "Base"
     defaults["planning_horizon_weeks"] = int(saved.get("planning_horizon_weeks", 26) or 26)
     defaults["weekly_demand_profile"] = saved.get("weekly_demand_profile", "Front-loaded") or "Front-loaded"
+    defaults["monthly_review_day"] = int(saved.get("monthly_review_day", 1) or 1)
     defaults["source_moq_lbs"].update(saved.get("source_moq_lbs", {}))
     defaults["confidence_weights"].update(saved.get("confidence_weights", {}))
     defaults["dc_release_date"] = saved.get("dc_release_date", "2026-07-31") or "2026-07-31"
@@ -642,6 +644,28 @@ def summarize_order_baskets(plan_rows: list[dict], settings: dict) -> list[dict]
     return summaries
 
 
+def build_monthly_po_rows(plan_rows: list[dict], settings: dict) -> list[dict]:
+    next_review = next_monthly_review_date(settings).strftime("%Y-%m-%d")
+    rows = []
+    for row in plan_rows:
+        order_by = row.get("order_by_date", "Now")
+        include = order_by == "Now" or order_by <= next_review
+        if not include or number(row.get("recommended_order_lbs", 0.0)) <= 0:
+            continue
+        rows.append(
+            {
+                "Source": row.get("recommended_source", "None"),
+                "Copper Size": row["size"],
+                "Suggested Qty (lbs)": round(number(row.get("recommended_order_lbs", 0.0)), 0),
+                "Action": row.get("action_bucket", ""),
+                "Order By": order_by,
+                "Expected Receipt": row.get("expected_receipt_date", "N/A"),
+                "Reason": row.get("recommendation_reason", ""),
+            }
+        )
+    return rows
+
+
 def normalize_forecast_entries(raw_payload: dict | list) -> list[dict]:
     if isinstance(raw_payload, dict):
         entries = raw_payload.get("entries", [])
@@ -738,6 +762,15 @@ def target_dc_lbs_for_mover(mover_class: str, settings: dict) -> float:
     return number(settings.get("dc_target_lbs_by_mover", {}).get(mover_class, 1000.0))
 
 
+def next_monthly_review_date(settings: dict, base_date: datetime | None = None) -> datetime:
+    anchor = base_date or datetime.today()
+    review_day = max(1, min(28, int(settings.get("monthly_review_day", 1) or 1)))
+    if anchor.day <= review_day:
+        return anchor.replace(day=review_day, hour=0, minute=0, second=0, microsecond=0)
+    next_month = add_months(anchor.replace(day=1), 1)
+    return next_month.replace(day=review_day, hour=0, minute=0, second=0, microsecond=0)
+
+
 def recommendation_timing(row: dict, settings: dict) -> tuple[str, str]:
     source_name = row.get("recommended_source", settings.get("preferred_mill", ACTIVE_MILL))
     if source_name in DIST_SOURCES:
@@ -748,7 +781,11 @@ def recommendation_timing(row: dict, settings: dict) -> tuple[str, str]:
         lead_weeks = number(settings.get("source_lead_weeks", {}).get(settings.get("preferred_mill", ACTIVE_MILL), 11.0))
     weeks_to_stockout = number(row.get("net_coverage_weeks", 0.0))
     order_by_weeks = max(0.0, weeks_to_stockout - lead_weeks)
+    next_review = next_monthly_review_date(settings)
+    next_review_str = next_review.strftime("%Y-%m-%d")
     order_by = "Now" if row.get("action_bucket") in {"Order Now", "Pull From DC"} or order_by_weeks <= 0 else format_date_from_weeks(order_by_weeks)
+    if order_by != "Now" and order_by <= next_review_str:
+        order_by = next_review_str
     receipt_date = format_date_from_weeks(lead_weeks) if lead_weeks > 0 else "N/A"
     return order_by, receipt_date
 
@@ -760,6 +797,7 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
     preferred_mill = settings.get("preferred_mill", ACTIVE_MILL)
     future_mill = settings.get("future_mill", FUTURE_MILL)
     active_scenario = settings.get("active_scenario", "Base")
+    review_cycle_weeks = 4.345
     future_demand_map = build_future_demand_map(forecast_entries, active_scenario, settings)
     mover_map = classify_movers(items)
     planning_rows = []
@@ -789,7 +827,7 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
 
         safety_stock_lbs = weekly_usage * safety_weeks
         reorder_point_lbs = weekly_usage * float(lead_weeks.get(preferred_mill, 11.0)) + safety_stock_lbs
-        target_stock_lbs = weekly_usage * (float(lead_weeks.get(preferred_mill, 11.0)) + safety_weeks + 4.0)
+        target_stock_lbs = weekly_usage * (float(lead_weeks.get(preferred_mill, 11.0)) + safety_weeks + review_cycle_weeks)
         current_coverage_weeks = (current_supply_lbs / weekly_usage) if weekly_usage else 999.0
         net_coverage_weeks = (net_supply_lbs / weekly_usage) if weekly_usage else 999.0
         recommendation_qty = max(0.0, target_stock_lbs - net_supply_lbs)
@@ -1291,6 +1329,31 @@ def render_recommendations(plan_rows: list[dict]) -> None:
         st.write(f"- System reason: {selected_row['recommendation_reason']}")
 
 
+def render_monthly_po_tab(plan_rows: list[dict], settings: dict) -> None:
+    st.markdown("#### Monthly PO Draft")
+    if not plan_rows:
+        st.info("Load the workbook first to build a monthly PO draft.")
+        return
+    review_date = next_monthly_review_date(settings)
+    st.write(f"Monthly review date: {review_date.strftime('%Y-%m-%d')}")
+    st.write("This draft includes items that should be covered in the next monthly order cycle.")
+    po_rows = build_monthly_po_rows(plan_rows, settings)
+    if not po_rows:
+        st.info("No items currently need to be included in the next monthly PO draft.")
+        return
+    basket_summary = summarize_order_baskets(
+        [
+            row for row in plan_rows
+            if row["size"] in {po_row["Copper Size"] for po_row in po_rows}
+        ],
+        settings,
+    )
+    st.markdown("##### Basket Summary")
+    st.dataframe(basket_summary, use_container_width=True, hide_index=True)
+    st.markdown("##### Draft PO Lines")
+    st.dataframe(po_rows, use_container_width=True, hide_index=True)
+
+
 def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: list[dict]) -> None:
     st.markdown("#### Forecast Logic")
     st.caption("This tab explains how the current planning engine is producing its recommendations.")
@@ -1321,9 +1384,10 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
                 "net_supply_lbs = plant_available_lbs + dc_over_target_lbs + inbound_total_lbs",
                 "safety_stock_lbs = weekly_usage * safety_weeks",
                 "reorder_point_lbs = weekly_usage * preferred_mill_lead_weeks + safety_stock_lbs",
-                "target_stock_lbs = weekly_usage * (preferred_mill_lead_weeks + safety_weeks + 4)",
+                "target_stock_lbs = weekly_usage * (preferred_mill_lead_weeks + safety_weeks + monthly_review_cycle)",
                 "recommended_order_lbs = max(0, target_stock_lbs - net_supply_lbs)",
                 "MOQ is checked at the total source order basket level, not per SKU line",
+                "Monthly ordering cadence is assumed; next review cycle is used in PO timing",
             ]
         ),
         language="text",
@@ -1343,6 +1407,7 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
         st.write(f"Future mill: {settings.get('future_mill', FUTURE_MILL)}")
         st.write(f"Active scenario: {settings.get('active_scenario', 'Base')}")
         st.write(f"DC release date: {settings.get('dc_release_date', '2026-07-31')}")
+        st.write(f"Monthly review day: {settings.get('monthly_review_day', 1)}")
         st.write("Lead times (weeks):")
         for source_name, weeks in settings.get("source_lead_weeks", {}).items():
             st.write(f"- {source_name}: {weeks}")
@@ -1609,6 +1674,14 @@ def render_settings(settings: dict) -> None:
             value=int(settings.get("planning_horizon_weeks", 26)),
             step=2,
         )
+        monthly_review_day = st.number_input(
+            "Monthly review day",
+            min_value=1,
+            max_value=28,
+            value=int(settings.get("monthly_review_day", 1)),
+            step=1,
+            help="Day of month when copper orders are reviewed and placed.",
+        )
         weekly_demand_profile = st.selectbox(
             "Weekly demand profile",
             list(WEEKLY_PROFILES),
@@ -1725,6 +1798,7 @@ def render_settings(settings: dict) -> None:
                 "future_mill": future_mill,
                 "active_scenario": active_scenario,
                 "planning_horizon_weeks": int(planning_horizon_weeks),
+                "monthly_review_day": int(monthly_review_day),
                 "weekly_demand_profile": weekly_demand_profile,
                 "dc_release_date": dc_release_date.strip(),
                 "dc_target_lbs_by_mover": {
@@ -1995,10 +2069,11 @@ def main() -> None:
     large_job_entries = normalize_large_job_entries(load_json(LARGE_JOBS_PATH))
     plan_rows = build_plan(snapshot, overrides, settings, forecast_entries, large_job_entries)
     render_hero(snapshot, plan_rows)
-    summary_tab, dashboard_tab, items_tab, projection_tab, exceptions_tab, compare_tab, supply_tab, reorder_tab, logic_tab, future_tab, large_jobs_tab, actions_tab, review_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
+    summary_tab, dashboard_tab, monthly_po_tab, items_tab, projection_tab, exceptions_tab, compare_tab, supply_tab, reorder_tab, logic_tab, future_tab, large_jobs_tab, actions_tab, review_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
         [
             "Executive Summary",
             "Dashboard",
+            "Monthly PO Draft",
             "Copper Items",
             "Weekly Projection",
             "Exceptions",
@@ -2021,6 +2096,8 @@ def main() -> None:
         render_executive_summary(plan_rows, snapshot, settings)
     with dashboard_tab:
         render_dashboard(plan_rows, snapshot, settings)
+    with monthly_po_tab:
+        render_monthly_po_tab(plan_rows, settings)
     with items_tab:
         render_items(plan_rows)
     with projection_tab:
