@@ -1135,7 +1135,12 @@ def render_dashboard(plan_rows: list[dict], snapshot: dict, settings: dict) -> N
         st.write(f"Future mill: {settings.get('future_mill', FUTURE_MILL)}")
         st.write(f"Active scenario: {settings.get('active_scenario', 'Base')}")
         st.write("Distribution centers are used as safety coverage when plant supply gets too tight.")
+        st.write(f"Active workbook: {snapshot.get('source_name', 'Not loaded')}")
         st.write(f"Latest import: {snapshot.get('imported_at', 'Not loaded')}")
+        items = snapshot.get("items", [])
+        if items:
+            st.write(f"Active current inventory: {round(sum(number(item.get('icc_inventory_current_lbs', 0.0)) for item in items), 0):,.0f} lbs")
+            st.write(f"Active on-order total: {round(sum(number(item.get('total_on_order_lbs', 0.0)) for item in items), 0):,.0f} lbs")
     chart_data = {row["size"]: row["recommended_order_lbs"] for row in plan_rows if row["recommended_order_lbs"] > 0}
     if chart_data:
         st.markdown("#### Top Recommended Buys")
@@ -1495,6 +1500,26 @@ def render_history_tab() -> None:
     st.dataframe(list(reversed(entries)), use_container_width=True, hide_index=True)
 
 
+def render_active_snapshot_tab(snapshot: dict) -> None:
+    st.markdown("#### Active Snapshot")
+    if not snapshot or not snapshot.get("items"):
+        st.info("No active workbook snapshot is currently loaded.")
+        return
+    items = snapshot.get("items", [])
+    summary_rows = [
+        {"Metric": "Active workbook", "Value": snapshot.get("source_name", "Unknown")},
+        {"Metric": "Imported at", "Value": snapshot.get("imported_at", "Unknown")},
+        {"Metric": "Copper sizes", "Value": len(items)},
+        {"Metric": "Current ICC inventory (lbs)", "Value": round(sum(number(item.get("icc_inventory_current_lbs", 0.0)) for item in items), 0)},
+        {"Metric": "Plant available (lbs)", "Value": round(sum(max(0.0, number(item.get("icc_inventory_current_lbs", 0.0)) - number(item.get("jobs_pending_lbs", 0.0))) for item in items), 0)},
+        {"Metric": "Total on order (lbs)", "Value": round(sum(number(item.get("total_on_order_lbs", 0.0)) for item in items), 0)},
+        {"Metric": "DC on hand (lbs)", "Value": round(sum(number(item.get("williams_on_hand_lbs", 0.0)) + number(item.get("maverick_on_hand_lbs", 0.0)) for item in items), 0)},
+        {"Metric": "Adjusted 7-month usage (lbs)", "Value": round(sum(number(item.get("adjusted_usage_7mo_lbs", 0.0)) for item in items), 0)},
+    ]
+    st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+    st.caption("This is the single workbook snapshot currently driving the planning recommendations.")
+
+
 def render_snapshot_compare_tab(snapshot: dict) -> None:
     st.markdown("#### Snapshot Comparison")
     history_payload = load_json(IMPORT_HISTORY_PATH)
@@ -1850,19 +1875,27 @@ def rows_to_csv(rows: list[dict]) -> str:
 
 def render_import(snapshot: dict) -> None:
     st.markdown("#### Workbook Import")
+    if snapshot and snapshot.get("items"):
+        st.success(
+            f"Active snapshot: {snapshot.get('source_name', 'Unknown')} imported {snapshot.get('imported_at', 'Unknown')}"
+        )
     default_workbook_path = resolve_default_workbook_path()
     uploaded_file = st.file_uploader("Upload copper workbook", type=["xlsx"])
     if uploaded_file and st.button("Import uploaded workbook"):
         parsed = parse_workbook(uploaded_file.getvalue(), uploaded_file.name)
         save_json(STATE_PATH, parsed)
         append_import_history(parsed)
-        st.success(f"Imported {len(parsed.get('items', []))} copper sizes.")
+        st.success(
+            f"Imported {len(parsed.get('items', []))} copper sizes from {parsed.get('source_name', uploaded_file.name)} at {parsed.get('imported_at', '')}."
+        )
         st.rerun()
     if default_workbook_path.exists() and st.button(f"Load default workbook: {default_workbook_path.name}"):
         parsed = parse_workbook(default_workbook_path.read_bytes(), default_workbook_path.name)
         save_json(STATE_PATH, parsed)
         append_import_history(parsed)
-        st.success(f"Loaded {default_workbook_path.name}.")
+        st.success(
+            f"Loaded {parsed.get('source_name', default_workbook_path.name)} at {parsed.get('imported_at', '')}."
+        )
         st.rerun()
     st.caption(str(default_workbook_path))
     if snapshot:
@@ -2069,9 +2102,10 @@ def main() -> None:
     large_job_entries = normalize_large_job_entries(load_json(LARGE_JOBS_PATH))
     plan_rows = build_plan(snapshot, overrides, settings, forecast_entries, large_job_entries)
     render_hero(snapshot, plan_rows)
-    summary_tab, dashboard_tab, monthly_po_tab, items_tab, projection_tab, exceptions_tab, compare_tab, supply_tab, reorder_tab, logic_tab, future_tab, large_jobs_tab, actions_tab, review_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
+    summary_tab, active_snapshot_tab, dashboard_tab, monthly_po_tab, items_tab, projection_tab, exceptions_tab, compare_tab, supply_tab, reorder_tab, logic_tab, future_tab, large_jobs_tab, actions_tab, review_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
         [
             "Executive Summary",
+            "Active Snapshot",
             "Dashboard",
             "Monthly PO Draft",
             "Copper Items",
@@ -2094,6 +2128,8 @@ def main() -> None:
     )
     with summary_tab:
         render_executive_summary(plan_rows, snapshot, settings)
+    with active_snapshot_tab:
+        render_active_snapshot_tab(snapshot)
     with dashboard_tab:
         render_dashboard(plan_rows, snapshot, settings)
     with monthly_po_tab:
