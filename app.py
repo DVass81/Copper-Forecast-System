@@ -442,6 +442,33 @@ def ensure_local_snapshot_exists() -> None:
     append_import_history(snapshot)
 
 
+def normalize_snapshot(snapshot: dict) -> dict:
+    if not isinstance(snapshot, dict):
+        return {"source_name": "", "imported_at": "", "items": []}
+    items = snapshot.get("items", [])
+    cleaned_items = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        size = clean_size(item.get("size"))
+        if not size:
+            continue
+        size_key = canonical_size(size)
+        if size_key in OBSOLETE_SIZES or size_key in seen:
+            continue
+        normalized = dict(item)
+        normalized["size"] = size
+        seen.add(size_key)
+        cleaned_items.append(normalized)
+    cleaned_items = sorted(cleaned_items, key=lambda entry: size_sort_key(entry["size"]))
+    return {
+        "source_name": snapshot.get("source_name", ""),
+        "imported_at": snapshot.get("imported_at", ""),
+        "items": cleaned_items,
+    }
+
+
 def clean_size(value: object) -> str:
     return str(value or "").strip()
 
@@ -2073,7 +2100,7 @@ def render_import(snapshot: dict) -> None:
     default_workbook_path = resolve_default_workbook_path()
     uploaded_file = st.file_uploader("Upload copper workbook", type=["xlsx"])
     if uploaded_file and st.button("Import uploaded workbook"):
-        parsed = parse_workbook(uploaded_file.getvalue(), uploaded_file.name)
+        parsed = normalize_snapshot(parse_workbook(uploaded_file.getvalue(), uploaded_file.name))
         save_json(STATE_PATH, parsed)
         append_import_history(parsed)
         st.success(
@@ -2081,7 +2108,7 @@ def render_import(snapshot: dict) -> None:
         )
         st.rerun()
     if default_workbook_path.exists() and st.button(f"Load default workbook: {default_workbook_path.name}"):
-        parsed = parse_workbook(default_workbook_path.read_bytes(), default_workbook_path.name)
+        parsed = normalize_snapshot(parse_workbook(default_workbook_path.read_bytes(), default_workbook_path.name))
         save_json(STATE_PATH, parsed)
         append_import_history(parsed)
         st.success(
@@ -2326,7 +2353,7 @@ def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecas
             remote_schedule = fetch_supabase_state(config, "current_schedule")
             remote_review_history = fetch_supabase_state(config, "review_history")
             if remote_snapshot:
-                save_json(STATE_PATH, remote_snapshot)
+                save_json(STATE_PATH, normalize_snapshot(remote_snapshot))
             if remote_overrides:
                 save_json(OVERRIDES_PATH, remote_overrides)
             if remote_settings:
@@ -2352,7 +2379,8 @@ def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecas
 def main() -> None:
     inject_styles()
     ensure_local_snapshot_exists()
-    snapshot = load_json(STATE_PATH)
+    snapshot = normalize_snapshot(load_json(STATE_PATH))
+    save_json(STATE_PATH, snapshot)
     overrides = load_json(OVERRIDES_PATH)
     settings = load_settings()
     forecast_entries = normalize_forecast_entries(load_json(FORECASTS_PATH))
