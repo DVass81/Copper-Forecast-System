@@ -19,6 +19,7 @@ IMPORT_HISTORY_PATH = DATA_DIR / "copper_import_history.json"
 ACTIONS_PATH = DATA_DIR / "copper_item_actions.json"
 LARGE_JOBS_PATH = DATA_DIR / "copper_large_jobs.json"
 REVIEW_HISTORY_PATH = DATA_DIR / "copper_review_history.json"
+SCHEDULE_PATH = DATA_DIR / "copper_current_schedule.json"
 LOCAL_WORKBOOK_PATH = APP_DIR / "March Copper Review Final.xlsx"
 LOGO_CANDIDATES = [
     APP_DIR / "icc_logo.png",
@@ -724,6 +725,37 @@ def normalize_large_job_entries(raw_payload: dict | list) -> list[dict]:
     return cleaned
 
 
+def normalize_schedule_entries(raw_payload: dict | list) -> list[dict]:
+    if isinstance(raw_payload, dict):
+        entries = raw_payload.get("entries", [])
+    elif isinstance(raw_payload, list):
+        entries = raw_payload
+    else:
+        entries = []
+    cleaned = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        size = clean_size(entry.get("size"))
+        want_date = clean_size(entry.get("want_date"))
+        lbs = number(entry.get("lbs"))
+        if size and want_date and lbs:
+            want_dt = parse_date_string(want_date)
+            ship_date = clean_size(entry.get("ship_date")) or (want_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+            cleaned.append(
+                {
+                    "size": size,
+                    "want_date": want_dt.strftime("%Y-%m-%d"),
+                    "ship_date": ship_date,
+                    "lbs": lbs,
+                    "job_name": clean_size(entry.get("job_name")),
+                    "customer": clean_size(entry.get("customer")),
+                    "note": clean_size(entry.get("note")),
+                }
+            )
+    return cleaned
+
+
 def build_future_demand_map(forecast_entries: list[dict], active_scenario: str, settings: dict) -> dict[str, dict]:
     selected = [entry for entry in forecast_entries if entry.get("scenario") == active_scenario]
     grouped: dict[str, list[dict]] = {}
@@ -762,6 +794,24 @@ def target_dc_lbs_for_mover(mover_class: str, settings: dict) -> float:
     return number(settings.get("dc_target_lbs_by_mover", {}).get(mover_class, 1000.0))
 
 
+def schedule_lbs_in_window(
+    schedule_entries: list[dict],
+    size: str,
+    start_date: datetime | None = None,
+    days_forward: int = 35,
+) -> float:
+    window_start = (start_date or datetime.today()).replace(hour=0, minute=0, second=0, microsecond=0)
+    window_end = window_start + timedelta(days=days_forward)
+    total = 0.0
+    for entry in schedule_entries:
+        if entry.get("size") != size:
+            continue
+        want_dt = parse_date_string(entry.get("want_date", ""), fallback=window_start)
+        if window_start <= want_dt <= window_end:
+            total += number(entry.get("lbs", 0.0))
+    return total
+
+
 def next_monthly_review_date(settings: dict, base_date: datetime | None = None) -> datetime:
     anchor = base_date or datetime.today()
     review_day = max(1, min(28, int(settings.get("monthly_review_day", 1) or 1)))
@@ -790,7 +840,14 @@ def recommendation_timing(row: dict, settings: dict) -> tuple[str, str]:
     return order_by, receipt_date
 
 
-def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries: list[dict], large_job_entries: list[dict]) -> list[dict]:
+def build_plan(
+    snapshot: dict,
+    overrides: dict,
+    settings: dict,
+    forecast_entries: list[dict],
+    large_job_entries: list[dict],
+    schedule_entries: list[dict],
+) -> list[dict]:
     items = snapshot.get("items", [])
     lead_weeks = settings.get("source_lead_weeks", {})
     safety_by_mover = settings.get("safety_weeks_by_mover", {})
@@ -810,7 +867,10 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
             sum(number(entry.get("lbs", 0.0)) for entry in large_job_entries if entry.get("size") == item["size"])
             / max(1, round(number(settings.get("planning_horizon_weeks", 26)) / 4))
         )
-        forecast_monthly_lbs = max(0.0, base_monthly_lbs + manual_adjustment_lbs + future_sales_lbs + large_job_monthly_lbs)
+        schedule_monthly_lbs = schedule_lbs_in_window(schedule_entries, item["size"])
+        forecast_monthly_lbs = max(
+            0.0, base_monthly_lbs + manual_adjustment_lbs + future_sales_lbs + large_job_monthly_lbs + schedule_monthly_lbs
+        )
         weekly_usage = forecast_monthly_lbs / 4.345 if forecast_monthly_lbs else 0.0
         mover_class = mover_map.get(item["size"], "Slow")
         safety_weeks = float(safety_by_mover.get(mover_class, DEFAULT_SAFETY_WEEKS_BY_MOVER[mover_class]))
@@ -862,6 +922,7 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
                 "manual_adjustment_lbs": manual_adjustment_lbs,
                 "future_sales_monthly_lbs": future_sales_lbs,
                 "large_job_monthly_lbs": large_job_monthly_lbs,
+                "schedule_monthly_lbs": schedule_monthly_lbs,
                 "forecast_monthly_lbs": forecast_monthly_lbs,
                 "plant_available_lbs": plant_available_lbs,
                 "dc_on_hand_lbs": dc_on_hand_lbs,
@@ -895,7 +956,13 @@ def build_plan(snapshot: dict, overrides: dict, settings: dict, forecast_entries
     return sorted(planning_rows, key=planning_sort_key)
 
 
-def get_monthly_demand_map(plan_row: dict, forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> dict[str, float]:
+def get_monthly_demand_map(
+    plan_row: dict,
+    forecast_entries: list[dict],
+    large_job_entries: list[dict],
+    schedule_entries: list[dict],
+    settings: dict,
+) -> dict[str, float]:
     active_scenario = settings.get("active_scenario", "Base")
     base_monthly = number(plan_row.get("base_monthly_lbs", 0.0)) + number(plan_row.get("manual_adjustment_lbs", 0.0))
     month_map: dict[str, float] = {}
@@ -934,10 +1001,16 @@ def monthly_profile_for_week_count(week_count: int, settings: dict) -> list[floa
     return [value / total for value in raw]
 
 
-def build_weekly_projection(plan_row: dict, forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> list[dict]:
+def build_weekly_projection(
+    plan_row: dict,
+    forecast_entries: list[dict],
+    large_job_entries: list[dict],
+    schedule_entries: list[dict],
+    settings: dict,
+) -> list[dict]:
     horizon_weeks = int(settings.get("planning_horizon_weeks", 26) or 26)
     today_week = start_of_week(datetime.today())
-    monthly_demand_map = get_monthly_demand_map(plan_row, forecast_entries, large_job_entries, settings)
+    monthly_demand_map = get_monthly_demand_map(plan_row, forecast_entries, large_job_entries, schedule_entries, settings)
     total_supply = number(plan_row.get("plant_available_lbs", 0.0))
     dc_on_hand_lbs = number(plan_row.get("dc_on_hand_lbs", 0.0))
     dc_target_lbs = number(plan_row.get("dc_target_lbs", 0.0))
@@ -958,6 +1031,11 @@ def build_weekly_projection(plan_row: dict, forecast_entries: list[dict], large_
         month_key: monthly_profile_for_week_count(len(week_list), settings)
         for month_key, week_list in month_groups.items()
     }
+    schedule_events: dict[str, float] = {}
+    for schedule in schedule_entries:
+        if schedule.get("size") == plan_row["size"]:
+            week_key = start_of_week(parse_date_string(schedule["want_date"])).strftime("%Y-%m-%d")
+            schedule_events[week_key] = schedule_events.get(week_key, 0.0) + number(schedule.get("lbs", 0.0))
     weeks = []
     running_supply = total_supply
     stockout_week = None
@@ -967,6 +1045,7 @@ def build_weekly_projection(plan_row: dict, forecast_entries: list[dict], large_
         week_index_in_month = month_groups[month_key].index(week_start)
         monthly_lbs = number(monthly_demand_map.get(month_key, plan_row.get("forecast_monthly_lbs", 0.0)))
         weekly_demand = monthly_lbs * month_profiles[month_key][week_index_in_month]
+        weekly_demand += number(schedule_events.get(week_start.strftime("%Y-%m-%d"), 0.0))
         inbound_lbs = number(inbound_events.get(week_index, 0.0))
         if week_start >= dc_release_week and dc_release_lbs > 0:
             inbound_lbs += dc_release_lbs
@@ -1001,10 +1080,16 @@ def summarize_projection(weeks: list[dict]) -> dict:
     }
 
 
-def build_exception_rows(plan_rows: list[dict], forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> list[dict]:
+def build_exception_rows(
+    plan_rows: list[dict],
+    forecast_entries: list[dict],
+    large_job_entries: list[dict],
+    schedule_entries: list[dict],
+    settings: dict,
+) -> list[dict]:
     rows = []
     for row in plan_rows:
-        weeks = build_weekly_projection(row, forecast_entries, large_job_entries, settings)
+        weeks = build_weekly_projection(row, forecast_entries, large_job_entries, schedule_entries, settings)
         projection_summary = summarize_projection(weeks)
         weeks_to_stockout = projection_summary["weeks_to_stockout"]
         horizon_bucket = "No stockout in horizon"
@@ -1238,6 +1323,7 @@ def render_items(plan_rows: list[dict]) -> None:
     if row.get("future_confidence_mix"):
         st.write(f"Sales confidence mix: {row['future_confidence_mix']}")
     st.write(f"Large-job demand added: {row.get('large_job_monthly_lbs', 0.0):,.0f} lbs / month")
+    st.write(f"Schedule demand added: {row.get('schedule_monthly_lbs', 0.0):,.0f} lbs / month")
     st.write(f"DC target buffer: {row.get('dc_target_lbs', 0.0):,.0f} lbs")
     st.write(f"DC release to ICC on release date: {row.get('dc_over_target_lbs', 0.0):,.0f} lbs")
     if row.get("moq_note"):
@@ -1359,7 +1445,12 @@ def render_monthly_po_tab(plan_rows: list[dict], settings: dict) -> None:
     st.dataframe(po_rows, use_container_width=True, hide_index=True)
 
 
-def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: list[dict]) -> None:
+def render_logic_tab(
+    settings: dict,
+    plan_rows: list[dict],
+    forecast_entries: list[dict],
+    schedule_entries: list[dict],
+) -> None:
     st.markdown("#### Forecast Logic")
     st.caption("This tab explains how the current planning engine is producing its recommendations.")
 
@@ -1433,24 +1524,30 @@ def render_logic_tab(settings: dict, plan_rows: list[dict], forecast_entries: li
         for confidence, weight in settings.get("confidence_weights", {}).items():
             st.write(f"- {confidence}: {weight}")
         st.write(f"Future demand entries loaded: {len(forecast_entries)}")
+        st.write(f"Current schedule lines loaded: {len(schedule_entries)}")
         st.write(f"Items currently in plan: {len(plan_rows)}")
 
     st.markdown("##### What This Version Does Not Do Yet")
-    st.write("`Production schedule demand` is not yet loaded separately from history.")
+    st.write("`Production schedule demand` is entered manually today, not yet pulled directly from ERP.")
     st.write("`Weighted sales pipeline logic` is not built yet.")
-    st.write("`True week-by-week depletion modeling` is not built yet.")
     st.write("`Supplier MOQ, lot size, and price break logic` are not built yet.")
     st.write("`ERP API automation` is not built yet.")
 
 
-def render_projection_tab(plan_rows: list[dict], forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> None:
+def render_projection_tab(
+    plan_rows: list[dict],
+    forecast_entries: list[dict],
+    large_job_entries: list[dict],
+    schedule_entries: list[dict],
+    settings: dict,
+) -> None:
     st.markdown("#### Weekly Projection")
     if not plan_rows:
         st.info("Load your workbook first to build weekly projections.")
         return
     selected_size = st.selectbox("Projection item", [row["size"] for row in plan_rows], key="projection_size")
     selected_row = next(row for row in plan_rows if row["size"] == selected_size)
-    weeks = build_weekly_projection(selected_row, forecast_entries, large_job_entries, settings)
+    weeks = build_weekly_projection(selected_row, forecast_entries, large_job_entries, schedule_entries, settings)
     summary = summarize_projection(weeks)
     summary_cols = st.columns(4)
     summary_cols[0].metric("Active scenario", selected_row["active_scenario"])
@@ -1474,12 +1571,18 @@ def render_projection_tab(plan_rows: list[dict], forecast_entries: list[dict], l
     )
 
 
-def render_exceptions_tab(plan_rows: list[dict], forecast_entries: list[dict], large_job_entries: list[dict], settings: dict) -> None:
+def render_exceptions_tab(
+    plan_rows: list[dict],
+    forecast_entries: list[dict],
+    large_job_entries: list[dict],
+    schedule_entries: list[dict],
+    settings: dict,
+) -> None:
     st.markdown("#### Exception Dashboard")
     if not plan_rows:
         st.info("No exceptions to show until the workbook is loaded.")
         return
-    exception_rows = build_exception_rows(plan_rows, forecast_entries, large_job_entries, settings)
+    exception_rows = build_exception_rows(plan_rows, forecast_entries, large_job_entries, schedule_entries, settings)
     filter_value = st.selectbox(
         "Exception filter",
         ["All", "Stockout <= 4 weeks", "Stockout <= 8 weeks", "Stockout <= 12 weeks", "No stockout in horizon"],
@@ -2016,11 +2119,73 @@ def render_large_jobs_tab(plan_rows: list[dict], large_job_entries: list[dict]) 
         st.info("No large jobs entered yet.")
 
 
+def render_schedule_tab(plan_rows: list[dict], schedule_entries: list[dict]) -> None:
+    st.markdown("#### Current Schedule")
+    st.caption("Use this to capture current scheduled demand by copper size. Ship date is set to one day after the want date.")
+    if not plan_rows:
+        st.info("Load your workbook first so active copper sizes are available.")
+        return
+    size_options = [row["size"] for row in plan_rows]
+    with st.form("schedule_form"):
+        cols = st.columns(5)
+        job_name = cols[0].text_input("Job / Program")
+        customer = cols[1].text_input("Customer")
+        selected_size = cols[2].selectbox("Copper size", size_options, key="schedule_size")
+        want_date = cols[3].date_input("Want date", value=datetime.today().date(), key="schedule_want_date")
+        lbs = cols[4].number_input("Copper lbs", min_value=0.0, step=100.0, key="schedule_lbs")
+        auto_ship_date = want_date + timedelta(days=1)
+        st.write(f"Calculated ship date: {auto_ship_date.strftime('%Y-%m-%d')}")
+        note = st.text_area("Schedule note", height=90, key="schedule_note")
+        submitted = st.form_submit_button("Add schedule line")
+    payload = {"entries": list(schedule_entries)}
+    if submitted:
+        payload["entries"].append(
+            {
+                "job_name": job_name.strip(),
+                "customer": customer.strip(),
+                "size": selected_size,
+                "want_date": want_date.strftime("%Y-%m-%d"),
+                "ship_date": auto_ship_date.strftime("%Y-%m-%d"),
+                "lbs": lbs,
+                "note": note.strip(),
+            }
+        )
+        save_json(SCHEDULE_PATH, payload)
+        st.success(f"Saved schedule line for {selected_size}.")
+        st.rerun()
+    if schedule_entries:
+        total_lbs = sum(number(entry.get("lbs", 0.0)) for entry in schedule_entries)
+        upcoming_ship = min((entry.get("ship_date", "") for entry in schedule_entries if entry.get("ship_date")), default="N/A")
+        summary_cols = st.columns(3)
+        summary_cols[0].metric("Schedule lines", len(schedule_entries))
+        summary_cols[1].metric("Scheduled copper", f"{total_lbs:,.0f} lbs")
+        summary_cols[2].metric("Earliest ship date", upcoming_ship)
+        st.dataframe(
+            [
+                {
+                    "Job / Program": entry.get("job_name", ""),
+                    "Customer": entry.get("customer", ""),
+                    "Copper Size": entry["size"],
+                    "Want Date": entry["want_date"],
+                    "Ship Date": entry.get("ship_date", ""),
+                    "Copper lbs": entry["lbs"],
+                    "Note": entry.get("note", ""),
+                }
+                for entry in sorted(schedule_entries, key=lambda item: (item["want_date"], item["size"]))
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No current schedule demand has been entered yet.")
+
+
 def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecast_entries: list[dict], large_job_entries: list[dict]) -> None:
     config = get_supabase_config()
     import_history = load_json(IMPORT_HISTORY_PATH)
     item_actions = load_json(ACTIONS_PATH)
     review_history = load_json(REVIEW_HISTORY_PATH)
+    schedule_entries = normalize_schedule_entries(load_json(SCHEDULE_PATH))
     st.markdown("#### Supabase Connection")
     if config["enabled"]:
         st.success("Supabase configuration detected.")
@@ -2055,8 +2220,9 @@ def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecas
             upsert_supabase_state(config, "import_history", import_history)
             upsert_supabase_state(config, "item_actions", item_actions)
             upsert_supabase_state(config, "large_jobs", {"entries": large_job_entries})
+            upsert_supabase_state(config, "current_schedule", {"entries": schedule_entries})
             upsert_supabase_state(config, "review_history", review_history)
-            st.success("Synced snapshot, overrides, settings, future demand, large jobs, import history, item actions, and review history to Supabase.")
+            st.success("Synced snapshot, overrides, settings, future demand, large jobs, current schedule, import history, item actions, and review history to Supabase.")
         except requests.RequestException as exc:
             st.error(f"Supabase sync failed: {exc}")
 
@@ -2069,6 +2235,7 @@ def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecas
             remote_import_history = fetch_supabase_state(config, "import_history")
             remote_item_actions = fetch_supabase_state(config, "item_actions")
             remote_large_jobs = fetch_supabase_state(config, "large_jobs")
+            remote_schedule = fetch_supabase_state(config, "current_schedule")
             remote_review_history = fetch_supabase_state(config, "review_history")
             if remote_snapshot:
                 save_json(STATE_PATH, remote_snapshot)
@@ -2084,6 +2251,8 @@ def render_supabase_tab(snapshot: dict, overrides: dict, settings: dict, forecas
                 save_json(ACTIONS_PATH, remote_item_actions)
             if remote_large_jobs:
                 save_json(LARGE_JOBS_PATH, remote_large_jobs)
+            if remote_schedule:
+                save_json(SCHEDULE_PATH, remote_schedule)
             if remote_review_history:
                 save_json(REVIEW_HISTORY_PATH, remote_review_history)
             st.success("Loaded available state from Supabase.")
@@ -2100,9 +2269,10 @@ def main() -> None:
     settings = load_settings()
     forecast_entries = normalize_forecast_entries(load_json(FORECASTS_PATH))
     large_job_entries = normalize_large_job_entries(load_json(LARGE_JOBS_PATH))
-    plan_rows = build_plan(snapshot, overrides, settings, forecast_entries, large_job_entries)
+    schedule_entries = normalize_schedule_entries(load_json(SCHEDULE_PATH))
+    plan_rows = build_plan(snapshot, overrides, settings, forecast_entries, large_job_entries, schedule_entries)
     render_hero(snapshot, plan_rows)
-    summary_tab, active_snapshot_tab, dashboard_tab, monthly_po_tab, items_tab, projection_tab, exceptions_tab, compare_tab, supply_tab, reorder_tab, logic_tab, future_tab, large_jobs_tab, actions_tab, review_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
+    summary_tab, active_snapshot_tab, dashboard_tab, monthly_po_tab, items_tab, projection_tab, exceptions_tab, compare_tab, supply_tab, reorder_tab, logic_tab, future_tab, large_jobs_tab, schedule_tab, actions_tab, review_tab, overrides_tab, settings_tab, history_tab, import_tab, supabase_tab = st.tabs(
         [
             "Executive Summary",
             "Active Snapshot",
@@ -2117,6 +2287,7 @@ def main() -> None:
             "Logic",
             "Future Demand Plan",
             "Large Jobs",
+            "Current Schedule",
             "Item Actions",
             "Review History",
             "Manual Forecast Overrides",
@@ -2137,9 +2308,9 @@ def main() -> None:
     with items_tab:
         render_items(plan_rows)
     with projection_tab:
-        render_projection_tab(plan_rows, forecast_entries, large_job_entries, settings)
+        render_projection_tab(plan_rows, forecast_entries, large_job_entries, schedule_entries, settings)
     with exceptions_tab:
-        render_exceptions_tab(plan_rows, forecast_entries, large_job_entries, settings)
+        render_exceptions_tab(plan_rows, forecast_entries, large_job_entries, schedule_entries, settings)
     with compare_tab:
         render_snapshot_compare_tab(snapshot)
     with supply_tab:
@@ -2147,11 +2318,13 @@ def main() -> None:
     with reorder_tab:
         render_recommendations(plan_rows)
     with logic_tab:
-        render_logic_tab(settings, plan_rows, forecast_entries)
+        render_logic_tab(settings, plan_rows, forecast_entries, schedule_entries)
     with future_tab:
         render_future_demand(plan_rows, forecast_entries)
     with large_jobs_tab:
         render_large_jobs_tab(plan_rows, large_job_entries)
+    with schedule_tab:
+        render_schedule_tab(plan_rows, schedule_entries)
     with actions_tab:
         render_actions_tab(plan_rows)
     with review_tab:
