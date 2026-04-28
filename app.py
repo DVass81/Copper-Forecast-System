@@ -60,6 +60,14 @@ CONFIDENCE_WEIGHTS = {
     "Medium": 0.6,
     "Low": 0.3,
 }
+OBSOLETE_SIZE_LABELS = {
+    '.1875 X 4.00"',
+    '.250 X 1.75"',
+    '.375 X 1.75"',
+    '.5 X 3.0"',
+    '.625 X 4.0',
+    'T-174-F',
+}
 
 
 st.set_page_config(
@@ -438,6 +446,65 @@ def clean_size(value: object) -> str:
     return str(value or "").strip()
 
 
+def canonical_size(value: object) -> str:
+    text = clean_size(value).upper()
+    for token in ['"', " "]:
+        text = text.replace(token, "")
+    text = text.replace("X", "X")
+    text = text.replace(".50", ".5")
+    text = text.replace(".0", "")
+    return text
+
+
+OBSOLETE_SIZES = {canonical_size(size) for size in OBSOLETE_SIZE_LABELS}
+
+
+def size_sort_key(size: str) -> tuple:
+    text = clean_size(size)
+    if "X" in text.upper():
+        normalized = text.upper().replace('"', "")
+        parts = normalized.split("X", 1)
+        try:
+            thickness = float(parts[0].strip())
+        except ValueError:
+            thickness = 999.0
+        try:
+            width = float(parts[1].strip())
+        except ValueError:
+            width = 999.0
+        return (0, thickness, width, text.upper())
+    return (1, 999.0, 999.0, text.upper())
+
+
+def build_placeholder_item(size: str) -> dict:
+    return {
+        "size": size,
+        "inventory_7mo_ago_lbs": 0.0,
+        "received_prev_7mo_lbs": 0.0,
+        "usage_prev_7mo_lbs": 0.0,
+        "alt_for_other_lbs": 0.0,
+        "alt_used_for_size_lbs": 0.0,
+        "adjusted_usage_7mo_lbs": 0.0,
+        "usage_share": 0.0,
+        "avg_monthly_lbs": 0.0,
+        "williams_on_hand_lbs": 0.0,
+        "williams_on_order_lbs": 0.0,
+        "maverick_on_hand_lbs": 0.0,
+        "maverick_on_order_lbs": 0.0,
+        "sam_dong_on_order_lbs": 0.0,
+        "tecnofil_on_order_lbs": 0.0,
+        "total_on_order_lbs": 0.0,
+        "williams_general_inventory_lbs": 0.0,
+        "icc_inventory_current_lbs": 0.0,
+        "jobs_pending_lbs": 0.0,
+        "total_available_reported_lbs": 0.0,
+        "avg_monthly_supply_lbs": 0.0,
+        "large_jobs_prev_7mo_lbs": 0.0,
+        "avg_monthly_supply_ex_large_lbs": 0.0,
+        "data_status": "Placeholder",
+    }
+
+
 def number(value: object) -> float:
     if value in (None, ""):
         return 0.0
@@ -459,7 +526,7 @@ def parse_active_sizes(workbook) -> list[str]:
     sizes = []
     for row in worksheet.iter_rows(min_row=1, values_only=True):
         size = clean_size(row[0] if row else "")
-        if size:
+        if size and canonical_size(size) not in OBSOLETE_SIZES:
             sizes.append(size)
     return sizes
 
@@ -483,17 +550,31 @@ def parse_historical_usage(workbook) -> dict:
 
 def parse_copper_order(workbook, active_sizes: list[str]) -> list[dict]:
     worksheet = workbook["Copper Order"]
-    active_set = set(active_sizes)
-    items = []
+    active_display_map = {canonical_size(size): size for size in active_sizes}
+    items_by_key: dict[str, dict] = {}
     for row in worksheet.iter_rows(min_row=4, max_col=25, values_only=True):
         size = clean_size(row[0] if row else "")
         if not size or size.lower().startswith("total"):
             continue
-        if active_set and size not in active_set:
+        size_key = canonical_size(size)
+        if size_key in OBSOLETE_SIZES:
             continue
-        items.append(
-            {
-                "size": size,
+        display_size = active_display_map.get(size_key, size)
+        if active_display_map and size_key not in active_display_map:
+            non_dimensional_match = next(
+                (
+                    active_size
+                    for active_key, active_size in active_display_map.items()
+                    if "X" not in active_key and (size_key.startswith(active_key) or active_key.startswith(size_key))
+                ),
+                None,
+            )
+            if not non_dimensional_match:
+                continue
+            display_size = non_dimensional_match
+            size_key = canonical_size(non_dimensional_match)
+        items_by_key[size_key] = {
+                "size": display_size,
                 "inventory_7mo_ago_lbs": number(row[1]),
                 "received_prev_7mo_lbs": number(row[2]),
                 "usage_prev_7mo_lbs": number(row[3]),
@@ -516,9 +597,13 @@ def parse_copper_order(workbook, active_sizes: list[str]) -> list[dict]:
                 "avg_monthly_supply_lbs": number(row[20]),
                 "large_jobs_prev_7mo_lbs": number(row[21]),
                 "avg_monthly_supply_ex_large_lbs": number(row[22]),
+                "data_status": "Imported",
             }
-        )
-    return items
+    if active_sizes:
+        for size in active_sizes:
+            size_key = canonical_size(size)
+            items_by_key.setdefault(size_key, build_placeholder_item(size))
+    return sorted(items_by_key.values(), key=lambda item: size_sort_key(item["size"]))
 
 
 def parse_workbook(workbook_bytes: bytes, source_name: str) -> dict:
@@ -590,7 +675,8 @@ def planning_sort_key(row: dict) -> tuple:
         "Monitor": 3,
         "Healthy": 4,
     }
-    return (priority.get(row["action_bucket"], 9), -row["recommended_order_lbs"], row["size"])
+    size_key = size_sort_key(row["size"])
+    return (priority.get(row["action_bucket"], 9), -row["recommended_order_lbs"], size_key)
 
 
 def largest_dc_source(item: dict) -> str:
@@ -1294,7 +1380,7 @@ def render_items(plan_rows: list[dict]) -> None:
         st.info("No item details are available yet.")
         return
     row_map = {row["size"]: row for row in plan_rows}
-    selected = st.selectbox("Copper size", list(row_map))
+    selected = st.selectbox("Copper size", sorted(row_map, key=size_sort_key))
     row = row_map[selected]
     st.markdown(
         f"""
@@ -1317,6 +1403,7 @@ def render_items(plan_rows: list[dict]) -> None:
     bottom[3].metric("Recommended qty", f"{row['recommended_order_lbs']:,.0f} lbs")
     if row["override_note"]:
         st.info(f"Planner note: {row['override_note']}")
+    st.write(f"Data status: {row.get('data_status', 'Imported')}")
     st.write(f"Future sales demand added: {row['future_sales_monthly_lbs']:,.0f} lbs / month")
     if row["future_sales_months"]:
         st.write(f"Sales months in scenario: {row['future_sales_months']}")
@@ -1394,7 +1481,7 @@ def render_recommendations(plan_rows: list[dict]) -> None:
         )
         selected_size = st.selectbox(
             "Recommendation detail",
-            [row["size"] for row in plan_rows],
+            sorted([row["size"] for row in plan_rows], key=size_sort_key),
             key="recommendation_detail_size",
         )
         selected_row = next(row for row in plan_rows if row["size"] == selected_size)
@@ -1545,7 +1632,7 @@ def render_projection_tab(
     if not plan_rows:
         st.info("Load your workbook first to build weekly projections.")
         return
-    selected_size = st.selectbox("Projection item", [row["size"] for row in plan_rows], key="projection_size")
+    selected_size = st.selectbox("Projection item", sorted([row["size"] for row in plan_rows], key=size_sort_key), key="projection_size")
     selected_row = next(row for row in plan_rows if row["size"] == selected_size)
     weeks = build_weekly_projection(selected_row, forecast_entries, large_job_entries, schedule_entries, settings)
     summary = summarize_projection(weeks)
@@ -1618,6 +1705,7 @@ def render_active_snapshot_tab(snapshot: dict) -> None:
         {"Metric": "Total on order (lbs)", "Value": round(sum(number(item.get("total_on_order_lbs", 0.0)) for item in items), 0)},
         {"Metric": "DC on hand (lbs)", "Value": round(sum(number(item.get("williams_on_hand_lbs", 0.0)) + number(item.get("maverick_on_hand_lbs", 0.0)) for item in items), 0)},
         {"Metric": "Adjusted 7-month usage (lbs)", "Value": round(sum(number(item.get("adjusted_usage_7mo_lbs", 0.0)) for item in items), 0)},
+        {"Metric": "Placeholder sizes added", "Value": sum(1 for item in items if item.get("data_status") == "Placeholder")},
     ]
     st.dataframe(summary_rows, use_container_width=True, hide_index=True)
     st.caption("This is the single workbook snapshot currently driving the planning recommendations.")
@@ -1669,7 +1757,7 @@ def render_actions_tab(plan_rows: list[dict]) -> None:
         return
     actions_payload = load_json(ACTIONS_PATH)
     actions = actions_payload if isinstance(actions_payload, dict) else {}
-    selected_size = st.selectbox("Copper size", [row["size"] for row in plan_rows], key="action_item_size")
+    selected_size = st.selectbox("Copper size", sorted([row["size"] for row in plan_rows], key=size_sort_key), key="action_item_size")
     existing = actions.get(selected_size, {})
     with st.form("item_actions_form"):
         owner = st.text_input("Owner", value=existing.get("owner", ""))
@@ -1733,7 +1821,7 @@ def render_overrides(plan_rows: list[dict], overrides: dict) -> None:
     if not plan_rows:
         st.info("Load data before editing overrides.")
         return
-    selected_size = st.selectbox("Copper size to adjust", [row["size"] for row in plan_rows], key="override_size")
+    selected_size = st.selectbox("Copper size to adjust", sorted([row["size"] for row in plan_rows], key=size_sort_key), key="override_size")
     existing = overrides.get(selected_size, {})
     with st.form("override_form"):
         adjustment = st.number_input(
@@ -2013,7 +2101,7 @@ def render_future_demand(plan_rows: list[dict], forecast_entries: list[dict]) ->
         st.info("Load your workbook first so the app knows which copper sizes are active.")
         return
 
-    size_options = [row["size"] for row in plan_rows]
+    size_options = sorted([row["size"] for row in plan_rows], key=size_sort_key)
     with st.form("future_demand_form"):
         entry_cols = st.columns(5)
         selected_size = entry_cols[0].selectbox("Copper size", size_options)
@@ -2077,7 +2165,7 @@ def render_large_jobs_tab(plan_rows: list[dict], large_job_entries: list[dict]) 
     if not plan_rows:
         st.info("Load your workbook first so active copper sizes are available.")
         return
-    size_options = [row["size"] for row in plan_rows]
+    size_options = sorted([row["size"] for row in plan_rows], key=size_sort_key)
     with st.form("large_job_form"):
         cols = st.columns(4)
         selected_size = cols[0].selectbox("Copper size", size_options, key="large_job_size")
@@ -2125,7 +2213,7 @@ def render_schedule_tab(plan_rows: list[dict], schedule_entries: list[dict]) -> 
     if not plan_rows:
         st.info("Load your workbook first so active copper sizes are available.")
         return
-    size_options = [row["size"] for row in plan_rows]
+    size_options = sorted([row["size"] for row in plan_rows], key=size_sort_key)
     with st.form("schedule_form"):
         cols = st.columns(5)
         job_name = cols[0].text_input("Job / Program")
